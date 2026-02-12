@@ -103,6 +103,12 @@ _NUM_TIMESTEPS = flags.DEFINE_integer(
 _NUM_VIDEOS = flags.DEFINE_integer(
     "num_videos", 1, "Number of videos to record after training."
 )
+_OUTPUT_VIDEO = flags.DEFINE_string(
+    "output_video",
+    None,
+    "Output path for the rollout video (default: rollout{i}.mp4). "
+    "If num_videos > 1, {i} is appended before extension.",
+)
 _NUM_EVALS = flags.DEFINE_integer("num_evals", 5, "Number of evaluations")
 _REWARD_SCALING = flags.DEFINE_float("reward_scaling", 0.1, "Reward scaling")
 _EPISODE_LENGTH = flags.DEFINE_integer("episode_length", 1000, "Episode length")
@@ -535,8 +541,15 @@ def main(argv):
     frames = eval_env.render(
         traj, height=480, width=640, scene_option=scene_option
     )
-    media.write_video(f"rollout{i}.mp4", frames, fps=fps)
-    print(f"Rollout video saved as 'rollout{i}.mp4'.")
+    if _OUTPUT_VIDEO.value:
+      output_path = _OUTPUT_VIDEO.value
+      if _NUM_VIDEOS.value > 1:
+        base, ext = os.path.splitext(output_path)
+        output_path = f"{base}_{i}{ext}"
+    else:
+      output_path = f"rollout{i}.mp4"
+    media.write_video(output_path, frames, fps=fps)
+    print(f"Rollout video saved as '{output_path}'.")
 
 
 def run():
