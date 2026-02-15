@@ -104,15 +104,35 @@ class Joystick(go1_base.Go1Env):
       config: config_dict.ConfigDict = default_config(),
       config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
   ):
-    if task.startswith("rough"):
-      config.nconmax = 8 * 8192
-      config.njmax = 12 + 48
-    super().__init__(
-        xml_path=consts.task_to_xml(task).as_posix(),
-        config=config,
-        config_overrides=config_overrides,
-    )
-    self._post_init()
+      import pathlib
+      # Get the directory where THIS joystick.py file is located.
+      curr_ptr = pathlib.Path(__file__).parent
+
+      if task.startswith("rough"):
+          config.nconmax = 8 * 8192
+          config.njmax = 12 + 48
+
+      if "sar_stage" in task:
+          # Map the task names to the actual filenames.
+          xml_mapping = {
+              "sar_stage1": "scene_mjx_feetonly_sar_stage1.xml",
+              "sar_stage2": "scene_mjx_feetonly_sar_stage2.xml",
+              "sar_stage3": "scene_mjx_feetonly_sar_stage3.xml",
+              "sar_stage4": "scene_mjx_feetonly_sar_stage4.xml",
+              "sar_stage5": "scene_mjx_feetonly_sar_stage5.xml",
+          }
+          # Combine the directory path with the filename.
+          filename = xml_mapping.get(task, "scene_mjx_feetonly_sar_stage1.xml")
+          target_xml = (curr_ptr / "xmls" / filename).as_posix()
+      else:
+          target_xml = consts.task_to_xml(task).as_posix()
+
+      super().__init__(
+          xml_path=target_xml,
+          config=config,
+          config_overrides=config_overrides,
+      )
+      self._post_init()
 
   def _post_init(self) -> None:
     self._init_q = jp.array(self._mj_model.keyframe("home").qpos)
@@ -202,13 +222,17 @@ class Joystick(go1_base.Go1Env):
     )
 
     rng, key1, key2 = jax.random.split(rng, 3)
-    time_until_next_cmd = jax.random.exponential(key1) * 5.0
-    steps_until_next_cmd = jp.round(time_until_next_cmd / self.dt).astype(
-        jp.int32
-    )
-    cmd = jax.random.uniform(
-        key2, shape=(3,), minval=-self._cmd_a, maxval=self._cmd_a
-    )
+    if hasattr(self._config, "override_command") and self._config.override_command is not None:
+      cmd = jp.array(self._config.override_command, dtype=jp.float32)
+      steps_until_next_cmd = self._config.episode_length + 1
+    else:
+      time_until_next_cmd = jax.random.exponential(key1) * 5.0
+      steps_until_next_cmd = jp.round(time_until_next_cmd / self.dt).astype(
+          jp.int32
+      )
+      cmd = jax.random.uniform(
+          key2, shape=(3,), minval=-self._cmd_a, maxval=self._cmd_a
+      )
 
     info = {
         "rng": rng,
@@ -280,17 +304,18 @@ class Joystick(go1_base.Go1Env):
     state.info["last_last_act"] = state.info["last_act"]
     state.info["last_act"] = action
     state.info["steps_until_next_cmd"] -= 1
-    state.info["rng"], key1, key2 = jax.random.split(state.info["rng"], 3)
-    state.info["command"] = jp.where(
-        state.info["steps_until_next_cmd"] <= 0,
-        self.sample_command(key1, state.info["command"]),
-        state.info["command"],
-    )
-    state.info["steps_until_next_cmd"] = jp.where(
-        done | (state.info["steps_until_next_cmd"] <= 0),
-        jp.round(jax.random.exponential(key2) * 5.0 / self.dt).astype(jp.int32),
-        state.info["steps_until_next_cmd"],
-    )
+    if not (hasattr(self._config, "override_command") and self._config.override_command is not None):
+      state.info["rng"], key1, key2 = jax.random.split(state.info["rng"], 3)
+      state.info["command"] = jp.where(
+          state.info["steps_until_next_cmd"] <= 0,
+          self.sample_command(key1, state.info["command"]),
+          state.info["command"],
+      )
+      state.info["steps_until_next_cmd"] = jp.where(
+          done | (state.info["steps_until_next_cmd"] <= 0),
+          jp.round(jax.random.exponential(key2) * 5.0 / self.dt).astype(jp.int32),
+          state.info["steps_until_next_cmd"],
+      )
     state.info["feet_air_time"] *= ~contact
     state.info["last_contact"] = contact
     state.info["swing_peak"] *= ~contact

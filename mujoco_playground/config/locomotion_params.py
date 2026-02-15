@@ -38,7 +38,7 @@ def brax_ppo_config(
       discounting=0.97,
       learning_rate=3e-4,
       entropy_cost=1e-2,
-      num_envs=8192,
+      num_envs=64,
       batch_size=256,
       max_grad_norm=1.0,
       network_factory=config_dict.create(
@@ -50,7 +50,10 @@ def brax_ppo_config(
       num_resets_per_eval=10,
   )
 
-  if env_name in ("Go1JoystickFlatTerrain", "Go1JoystickRoughTerrain"):
+  if (
+      env_name in ("Go1JoystickFlatTerrain", "Go1JoystickRoughTerrain", "Go1JoystickSARStages")
+      or "Go1JoystickSARStage" in env_name
+  ):
     rl_config.num_timesteps = 200_000_000
     rl_config.num_evals = 10
     rl_config.network_factory = config_dict.create(

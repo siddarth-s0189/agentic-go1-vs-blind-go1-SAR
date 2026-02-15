@@ -14,10 +14,16 @@
 # ==============================================================================
 """Train a PPO agent using JAX on the specified environment."""
 
+# Must set before any mujoco/jax imports
+import os
+os.environ.setdefault("MUJOCO_GL", "egl")
+_xla = os.environ.get("XLA_FLAGS", "") + " --xla_gpu_triton_gemm_any=True"
+os.environ["XLA_FLAGS"] = _xla
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import datetime
 import functools
 import json
-import os
 import time
 import warnings
 
@@ -46,12 +52,6 @@ try:
 except ImportError:
   wandb = None
 
-
-xla_flags = os.environ.get("XLA_FLAGS", "")
-xla_flags += " --xla_gpu_triton_gemm_any=True"
-os.environ["XLA_FLAGS"] = xla_flags
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["MUJOCO_GL"] = "egl"
 
 # Ignore the info logs from brax
 logging.set_verbosity(logging.WARNING)
@@ -108,6 +108,11 @@ _OUTPUT_VIDEO = flags.DEFINE_string(
     None,
     "Output path for the rollout video (default: rollout{i}.mp4). "
     "If num_videos > 1, {i} is appended before extension.",
+)
+_CAMERA = flags.DEFINE_string(
+    "camera",
+    None,
+    "Camera name for rendering (e.g. hero_view, follow_side).",
 )
 _NUM_EVALS = flags.DEFINE_integer("num_evals", 5, "Number of evaluations")
 _REWARD_SCALING = flags.DEFINE_float("reward_scaling", 0.1, "Reward scaling")
@@ -211,6 +216,7 @@ def rscope_fn(full_states, obs, rew, done):
       "Collected rscope rollouts with reward"
       f" {episode_rewards.mean():.3f} +- {episode_rewards.std():.3f}"
   )
+
 
 
 def main(argv):
@@ -539,7 +545,11 @@ def main(argv):
   for i, rollout in enumerate(trajectories):
     traj = rollout[::render_every]
     frames = eval_env.render(
-        traj, height=480, width=640, scene_option=scene_option
+        traj,
+        height=480,
+        width=640,
+        camera=_CAMERA.value,
+        scene_option=scene_option,
     )
     if _OUTPUT_VIDEO.value:
       output_path = _OUTPUT_VIDEO.value
@@ -559,3 +569,5 @@ def run():
 
 if __name__ == "__main__":
   run()
+
+# dummy space, to trigger compiler to clear cache
