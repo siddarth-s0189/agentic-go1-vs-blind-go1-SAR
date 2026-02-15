@@ -15,6 +15,7 @@
 """VLM bridge for Go1 SAR navigation using GPT-4o vision."""
 
 import base64
+import json
 import os
 from typing import Dict
 
@@ -55,13 +56,83 @@ class GPT4pVLM:
     return base64.b64encode(jpeg_bytes.tobytes()).decode("utf-8")
 
   def get_action(self, image: np.ndarray) -> Dict[str, float]:
-    """Get navigation command from VLM (placeholder for Phase 1).
+    """Get navigation command from GPT-4o vision based on the current frame.
 
     Args:
       image: RGB image array from the robot's forward-facing camera.
 
     Returns:
-      Dict with vel_x, vel_y, yaw_rate (Phase 2 will implement real API call).
+      Dict with vel_x, vel_y, yaw_rate. On API failure, returns safe stop
+      (all zeros).
     """
-    del image  # Unused in placeholder
-    return {"vel_x": 0.5, "vel_y": 0.0, "yaw_rate": 0.0}
+    safe_stop = {"vel_x": 0.0, "vel_y": 0.0, "yaw_rate": 0.0}
+
+    try:
+      base64_str = self.encode_image(image)
+      response = self._client.chat.completions.create(
+          model=self._model,
+          messages=[
+              {
+                  "role": "system",
+                  "content": (
+                      "You are a quadruped robot navigator in a Search and "
+                      "Rescue debris field. Your camera faces forward. Avoid "
+                      "obstacles. You are constrained to a corridor width of "
+                      "1.5m. Output a JSON object with keys: 'vel_x' (-1.0 "
+                      "to 1.0), 'vel_y' (-1.0 to 1.0), 'yaw_rate' (-1.0 to "
+                      "1.0). If you see an obstacle, navigate around it but "
+                      "STAY within the corridor boundaries."
+                  ),
+              },
+              {
+                  "role": "user",
+                  "content": [
+                      {
+                          "type": "text",
+                          "text": "Analyze this frame and provide navigation vectors.",
+                      },
+                      {
+                          "type": "image_url",
+                          "image_url": {
+                              "url": f"data:image/jpeg;base64,{base64_str}",
+                          },
+                      },
+                  ],
+              },
+          ],
+          response_format={
+              "type": "json_schema",
+              "json_schema": {
+                  "name": "navigation_response",
+                  "strict": True,
+                  "schema": {
+                      "type": "object",
+                      "properties": {
+                          "vel_x": {
+                              "type": "number",
+                              "description": "Forward velocity -1.0 to 1.0",
+                          },
+                          "vel_y": {
+                              "type": "number",
+                              "description": "Lateral velocity -1.0 to 1.0",
+                          },
+                          "yaw_rate": {
+                              "type": "number",
+                              "description": "Yaw rate -1.0 to 1.0",
+                          },
+                      },
+                      "required": ["vel_x", "vel_y", "yaw_rate"],
+                      "additionalProperties": False,
+                  },
+              },
+          },
+      )
+      content = response.choices[0].message.content
+      parsed = json.loads(content)
+      return {
+          "vel_x": float(np.clip(parsed["vel_x"], -1.0, 1.0)),
+          "vel_y": float(np.clip(parsed["vel_y"], -1.0, 1.0)),
+          "yaw_rate": float(np.clip(parsed["yaw_rate"], -1.0, 1.0)),
+      }
+    except Exception:
+      return safe_stop
