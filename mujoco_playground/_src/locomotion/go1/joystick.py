@@ -104,28 +104,11 @@ class Joystick(go1_base.Go1Env):
       config: config_dict.ConfigDict = default_config(),
       config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
   ):
-      import pathlib
-      # Get the directory where THIS joystick.py file is located.
-      curr_ptr = pathlib.Path(__file__).parent
-
       if task.startswith("rough"):
           config.nconmax = 8 * 8192
           config.njmax = 12 + 48
 
-      if "sar_stage" in task:
-          # Map the task names to the actual filenames.
-          xml_mapping = {
-              "sar_stage1": "scene_mjx_feetonly_sar_stage1.xml",
-              "sar_stage2": "scene_mjx_feetonly_sar_stage2.xml",
-              "sar_stage3": "scene_mjx_feetonly_sar_stage3.xml",
-              "sar_stage4": "scene_mjx_feetonly_sar_stage4.xml",
-              "sar_stage5": "scene_mjx_feetonly_sar_stage5.xml",
-          }
-          # Combine the directory path with the filename.
-          filename = xml_mapping.get(task, "scene_mjx_feetonly_sar_stage1.xml")
-          target_xml = (curr_ptr / "xmls" / filename).as_posix()
-      else:
-          target_xml = consts.task_to_xml(task).as_posix()
+      target_xml = consts.task_to_xml(task).as_posix()
 
       super().__init__(
           xml_path=target_xml,

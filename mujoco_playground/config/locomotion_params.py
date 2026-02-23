@@ -50,9 +50,10 @@ def brax_ppo_config(
       num_resets_per_eval=10,
   )
 
-  if (
-      env_name in ("Go1JoystickFlatTerrain", "Go1JoystickRoughTerrain", "Go1JoystickSARStages")
-      or "Go1JoystickSARStage" in env_name
+  if env_name in (
+      "Go1JoystickFlatTerrain",
+      "Go1JoystickRoughTerrain",
+      "Go1JoystickSARStage5",
   ):
     rl_config.num_timesteps = 200_000_000
     rl_config.num_evals = 10

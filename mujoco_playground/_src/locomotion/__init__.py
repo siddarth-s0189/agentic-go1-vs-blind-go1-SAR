@@ -75,21 +75,6 @@ _envs = {
     "Go1JoystickRoughTerrain": functools.partial(
         go1_joystick.Joystick, task="rough_terrain"
     ),
-    "Go1JoystickSARStages": functools.partial(
-        go1_joystick.Joystick, task="sar_stages"
-    ),
-    "Go1JoystickSARStage1": functools.partial(
-        go1_joystick.Joystick, task="sar_stage1"
-    ),
-    "Go1JoystickSARStage2": functools.partial(
-        go1_joystick.Joystick, task="sar_stage2"
-    ),
-    "Go1JoystickSARStage3": functools.partial(
-        go1_joystick.Joystick, task="sar_stage3"
-    ),
-    "Go1JoystickSARStage4": functools.partial(
-        go1_joystick.Joystick, task="sar_stage4"
-    ),
     "Go1JoystickSARStage5": functools.partial(
         go1_joystick.Joystick, task="sar_stage5"
     ),
@@ -127,11 +112,6 @@ _cfgs = {
     "G1JoystickRoughTerrain": g1_joystick.default_config,
     "Go1JoystickFlatTerrain": go1_joystick.default_config,
     "Go1JoystickRoughTerrain": go1_joystick.default_config,
-    "Go1JoystickSARStages": _go1_sar_config,
-    "Go1JoystickSARStage1": _go1_sar_config,
-    "Go1JoystickSARStage2": _go1_sar_config,
-    "Go1JoystickSARStage3": _go1_sar_config,
-    "Go1JoystickSARStage4": _go1_sar_config,
     "Go1JoystickSARStage5": _go1_sar_config,
     "Go1Getup": go1_getup.default_config,
     "Go1Handstand": go1_handstand.default_config,
@@ -157,11 +137,6 @@ _randomizer = {
     "G1JoystickRoughTerrain": g1_randomize.domain_randomize,
     "Go1JoystickFlatTerrain": go1_randomize.domain_randomize,
     "Go1JoystickRoughTerrain": go1_randomize.domain_randomize,
-    "Go1JoystickSARStages": go1_randomize.domain_randomize,
-    "Go1JoystickSARStage1": go1_randomize.domain_randomize,
-    "Go1JoystickSARStage2": go1_randomize.domain_randomize,
-    "Go1JoystickSARStage3": go1_randomize.domain_randomize,
-    "Go1JoystickSARStage4": go1_randomize.domain_randomize,
     "Go1JoystickSARStage5": go1_randomize.domain_randomize,
     "Go1Getup": go1_randomize.domain_randomize,
     "Go1Handstand": go1_randomize.domain_randomize,

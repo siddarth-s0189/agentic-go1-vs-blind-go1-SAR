@@ -29,11 +29,6 @@ FULL_FLAT_TERRAIN_XML = ROOT_PATH / "xmls" / "scene_mjx_flat_terrain.xml"
 FULL_COLLISIONS_FLAT_TERRAIN_XML = (
     ROOT_PATH / "xmls" / "scene_mjx_fullcollisions_flat_terrain.xml"
 )
-FEET_ONLY_SAR_STAGES_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_sar_stages.xml"
-FEET_ONLY_SAR_STAGE1_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_sar_stage1.xml"
-FEET_ONLY_SAR_STAGE2_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_sar_stage2.xml"
-FEET_ONLY_SAR_STAGE3_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_sar_stage3.xml"
-FEET_ONLY_SAR_STAGE4_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_sar_stage4.xml"
 FEET_ONLY_SAR_STAGE5_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_sar_stage5.xml"
 
 
@@ -41,11 +36,6 @@ def task_to_xml(task_name: str) -> epath.Path:
   return {
       "flat_terrain": FEET_ONLY_FLAT_TERRAIN_XML,
       "rough_terrain": FEET_ONLY_ROUGH_TERRAIN_XML,
-      "sar_stages": FEET_ONLY_SAR_STAGES_XML,
-      "sar_stage1": FEET_ONLY_SAR_STAGE1_XML,
-      "sar_stage2": FEET_ONLY_SAR_STAGE2_XML,
-      "sar_stage3": FEET_ONLY_SAR_STAGE3_XML,
-      "sar_stage4": FEET_ONLY_SAR_STAGE4_XML,
       "sar_stage5": FEET_ONLY_SAR_STAGE5_XML,
   }[task_name]
 
@@ -74,14 +64,3 @@ GLOBAL_ANGVEL_SENSOR = "global_angvel"
 LOCAL_LINVEL_SENSOR = "local_linvel"
 ACCELEROMETER_SENSOR = "accelerometer"
 GYRO_SENSOR = "gyro"
-
-# Inside go1_constants.py
-_TASK_TO_XML = {
-    "flat_terrain": ...,
-    "rough_terrain": ...,
-    "sar_stage1": "scene_mjx_feetonly_sar_stage1.xml",
-    "sar_stage2": "scene_mjx_feetonly_sar_stage2.xml",
-    "sar_stage3": "scene_mjx_feetonly_sar_stage3.xml",
-    "sar_stage4": "scene_mjx_feetonly_sar_stage4.xml",
-    "sar_stage5": "scene_mjx_feetonly_sar_stage5.xml",
-}
