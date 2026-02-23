@@ -112,7 +112,7 @@ _OUTPUT_VIDEO = flags.DEFINE_string(
 _CAMERA = flags.DEFINE_string(
     "camera",
     None,
-    "Camera name for rendering (e.g. hero_view, follow_side).",
+    "Camera name for rendering (e.g. birds_eye, robot_fpv).",
 )
 _NUM_EVALS = flags.DEFINE_integer("num_evals", 5, "Number of evaluations")
 _REWARD_SCALING = flags.DEFINE_float("reward_scaling", 0.1, "Reward scaling")

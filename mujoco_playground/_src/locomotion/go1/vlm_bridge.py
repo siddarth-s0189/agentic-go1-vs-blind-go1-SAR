@@ -17,6 +17,7 @@
 import base64
 import json
 import os
+import pathlib
 from typing import Dict
 
 import cv2
@@ -24,10 +25,156 @@ import numpy as np
 from openai import OpenAI
 
 
+# ---------------------------------------------------------------------------
+# Procedural environment generator
+# ---------------------------------------------------------------------------
+
+def generate_stage5_xml(seed: int = 42, n_rubble: int = 120) -> str:
+  """Generate and write Stage 5 XML with a realistic debris field.
+
+  Fills the FOV rectangle (~5m x 3m) with rubble: pebbles (60%), debris (30%),
+  and large obstacles (10%). Uses no-overlap placement and a 0.6m safety zone
+  around the robot start. All pieces use matte concrete appearance.
+
+  Args:
+    seed: Random seed for reproducible layouts.
+    n_rubble: Target number of rubble pieces.
+
+  Returns:
+    Absolute path string of the written XML file.
+  """
+  rng = np.random.RandomState(seed)
+
+  # Size distribution: 60% pebbles (0.03–0.06), 30% debris (0.07–0.12),
+  # 10% obstacles (0.13–0.15). Place larger pieces first for better packing.
+  n_pebbles = int(n_rubble * 0.60)
+  n_debris = int(n_rubble * 0.30)
+  n_obstacles = n_rubble - n_pebbles - n_debris
+
+  specs: list[tuple[float, str]] = []
+  for _ in range(n_pebbles):
+    sz = float(rng.uniform(0.03, 0.06))
+    geom_type = "sphere" if rng.random() < 0.30 else "box"
+    specs.append((sz, geom_type))
+  for _ in range(n_debris):
+    sz = float(rng.uniform(0.07, 0.12))
+    geom_type = "sphere" if rng.random() < 0.30 else "box"
+    specs.append((sz, geom_type))
+  for _ in range(n_obstacles):
+    sz = float(rng.uniform(0.13, 0.15))
+    geom_type = "sphere" if rng.random() < 0.30 else "box"
+    specs.append((sz, geom_type))
+
+  specs.sort(key=lambda s: -s[0])  # Largest first for packing
+
+  # Edge-to-edge: full 5m x 3m FOV bounds; only exclusion is 0.6m around spawn (0,0)
+  FOV_X_MIN, FOV_X_MAX = 0.1, 4.9
+  FOV_Y_MIN, FOV_Y_MAX = -1.45, 1.45
+  SAFETY_RADIUS = 0.6
+  MIN_GAP = 0.05
+  MAX_PLACE_ATTEMPTS = 200
+
+  placed: list[tuple[float, float, float, str]] = []  # (x, y, size, geom_type)
+
+  for size, geom_type in specs:
+    found = False
+    for _ in range(MAX_PLACE_ATTEMPTS):
+      x = float(rng.uniform(FOV_X_MIN, FOV_X_MAX))
+      y = float(rng.uniform(FOV_Y_MIN, FOV_Y_MAX))
+
+      if x * x + y * y < SAFETY_RADIUS * SAFETY_RADIUS:
+        continue
+
+      overlap = False
+      for (ex, ey, es, _) in placed:
+        dist_sq = (x - ex) ** 2 + (y - ey) ** 2
+        min_dist = size + es + MIN_GAP
+        if dist_sq < min_dist * min_dist:
+          overlap = True
+          break
+      if overlap:
+        continue
+
+      placed.append((x, y, size, geom_type))
+      found = True
+      break
+
+  rubble_lines: list[str] = []
+  for idx, (x, y, size, geom_type) in enumerate(placed, start=1):
+    z = size  # Base at z=0: center at z=size for box/sphere
+    rubble_lines.append(
+        f'    <body name="rubble{idx}" pos="{x:.3f} {y:.3f} {z:.3f}">'
+        f'<geom name="rubble{idx}_geom" type="{geom_type}" '
+        f'size="{size:.3f} {size:.3f} {size:.3f}" '
+        f'material="debris_matte" '
+        f'condim="3" margin="0.02" gap="0.01" '
+        f'contype="1" conaffinity="1" priority="1" group="0"/></body>'
+    )
+
+  rubble_xml = "\n".join(rubble_lines)
+
+  xml_content = f"""<mujoco model="go1 SAR stage 5 - Debris Field">
+  <include file="go1_mjx_feetonly_sar.xml"/>
+
+  <statistic center="0 0 0.1" extent="0.8" meansize="0.04"/>
+
+  <visual>
+    <headlight diffuse=".8 .8 .8" ambient=".2 .2 .2" specular="1 1 1"/>
+    <rgba force="1 0 0 1"/>
+    <global azimuth="120" elevation="-20"/>
+    <map force="0.01"/>
+    <scale forcewidth="0.3" contactwidth="0.5" contactheight="0.2"/>
+    <quality shadowsize="8192"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="1 1 1" rgb2="1 1 1" width="800" height="800"/>
+    <texture type="2d" name="groundplane" file="assets/rocky_texture.png"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance=".8"/>
+    <material name="floor_dark" rgba="0.1 0.1 0.1 1"/>
+    <material name="concrete" rgba="0.3 0.3 0.3 1"/>
+    <material name="debris_matte" rgba="0.25 0.25 0.25 1" specular="0" shininess="0"/>
+    <material name="rust_metal" rgba="0.5 0.1 0.05 1" specular="0.8"/>
+    <material name="charcoal_wall" rgba="0.15 0.15 0.15 1"/>
+    <hfield name="hfield" file="assets/hfield.png" size="10 10 .05 1.0"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 5" dir="0 0 -1" directional="true" castshadow="true"/>
+    <geom name="floor" type="hfield" hfield="hfield" material="groundplane" contype="1" conaffinity="0" priority="1"
+      friction="1.0"/>
+
+    <!-- Robot spawns at (0,0) facing +X. Goal at x=5. Boundaries via software. -->
+    <site name="goal" pos="5 0 0" rgba="1 0 0 1" size="0.1"/>
+
+    <camera name="birds_eye" pos="2.5 0 3.5" xyaxes="1 0 0 0 1 0" fovy="60"/>
+
+    <!-- ENV 5: Realistic debris field — {len(placed)} pieces, no-overlap, seed={seed} -->
+{rubble_xml}
+  </worldbody>
+
+  <include file="sensor_feet.xml"/>
+
+  <keyframe>
+    <key name="home" qpos="0 0 0.35 1 0 0 0 0.1 0.9 -1.8 -0.1 0.9 -1.8 0.1 0.9 -1.8 -0.1 0.9 -1.8"
+      ctrl="0.1 0.9 -1.8 -0.1 0.9 -1.8 0.1 0.9 -1.8 -0.1 0.9 -1.8"/>
+  </keyframe>
+</mujoco>
+"""
+
+  xml_path = pathlib.Path(__file__).parent / "xmls" / "scene_mjx_feetonly_sar_stage5.xml"
+  xml_path.write_text(xml_content)
+  print(
+      f"[Stage5] Generated {len(placed)} rubble pieces (pebbles/debris/obstacles, "
+      f"no-overlap, seed={seed}) → {xml_path}"
+  )
+  return str(xml_path)
+
+
 class GPT4pVLM:
   """Vision Language Model bridge for quadruped SAR navigation."""
 
-  DEFAULT_MODEL = "gpt-4o-mini"
+  DEFAULT_MODEL = "gpt-4o"
 
   def __init__(self) -> None:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -55,17 +202,17 @@ class GPT4pVLM:
     _, jpeg_bytes = cv2.imencode(".jpg", bgr)
     return base64.b64encode(jpeg_bytes.tobytes()).decode("utf-8")
 
-  def get_action(self, image: np.ndarray) -> Dict[str, float]:
-    """Get navigation command from GPT-4o vision based on the current frame.
+  def get_action(self, image: np.ndarray) -> Dict:
+    """Get navigation command from GPT-4o vision based on the dual-view frame.
 
     Args:
-      image: RGB image array from the robot's forward-facing camera.
+      image: RGB image array (480 x 1280): left=Top-Down Drone, right=First-Person.
 
     Returns:
-      Dict with vel_x, vel_y, yaw_rate. On API failure, returns safe stop
-      (all zeros).
+      Dict with vel_x, vel_y, yaw_rate, explanation. On API failure, returns
+      safe stop (all zeros, explanation empty).
     """
-    safe_stop = {"vel_x": 0.0, "vel_y": 0.0, "yaw_rate": 0.0}
+    safe_stop = {"vel_x": 0.0, "vel_y": 0.0, "yaw_rate": 0.0, "explanation": ""}
 
     try:
       base64_str = self.encode_image(image)
@@ -75,13 +222,18 @@ class GPT4pVLM:
               {
                   "role": "system",
                   "content": (
-                      "You are a quadruped robot navigator in a Search and "
-                      "Rescue debris field. Your camera faces forward. Avoid "
-                      "obstacles. You are constrained to a corridor width of "
-                      "1.5m. Output a JSON object with keys: 'vel_x' (-1.0 "
-                      "to 1.0), 'vel_y' (-1.0 to 1.0), 'yaw_rate' (-1.0 to "
-                      "1.0). If you see an obstacle, navigate around it but "
-                      "STAY within the corridor boundaries."
+                      "You are an expert navigator for a Go1 quadruped. You are "
+                      "receiving a dual-feed: the Left image is a Top-Down Drone "
+                      "view; the Right image is your First-Person view. "
+                      "- Navigation: The navigable corridor is Y = -1.5 to 1.5. "
+                      "Stay centered. "
+                      "- Strategy: Walk over small debris, but navigate around "
+                      "blocks taller than your knees. "
+                      "- Goal: Your destination is the red marker at the far end "
+                      "of the field (World +X). "
+                      "- Output: Respond ONLY with a JSON object: "
+                      '{"vel_x": float, "vel_y": float, "yaw_rate": float, '
+                      '"explanation": "string"}'
                   ),
               },
               {
@@ -89,7 +241,7 @@ class GPT4pVLM:
                   "content": [
                       {
                           "type": "text",
-                          "text": "Analyze this frame and provide navigation vectors.",
+                          "text": "Analyze this dual-view frame and provide navigation.",
                       },
                       {
                           "type": "image_url",
@@ -120,8 +272,12 @@ class GPT4pVLM:
                               "type": "number",
                               "description": "Yaw rate -1.0 to 1.0",
                           },
+                          "explanation": {
+                              "type": "string",
+                              "description": "Brief reasoning for the chosen action",
+                          },
                       },
-                      "required": ["vel_x", "vel_y", "yaw_rate"],
+                      "required": ["vel_x", "vel_y", "yaw_rate", "explanation"],
                       "additionalProperties": False,
                   },
               },
@@ -133,6 +289,7 @@ class GPT4pVLM:
           "vel_x": float(np.clip(parsed["vel_x"], -1.0, 1.0)),
           "vel_y": float(np.clip(parsed["vel_y"], -1.0, 1.0)),
           "yaw_rate": float(np.clip(parsed["yaw_rate"], -1.0, 1.0)),
+          "explanation": str(parsed.get("explanation", "")),
       }
     except Exception:
       return safe_stop
@@ -141,50 +298,25 @@ class GPT4pVLM:
       self,
       image: np.ndarray,
       current_vlm_command: np.ndarray,
-      camera: str = "hero_view",
+      camera: str = "birds_eye",
   ) -> np.ndarray:
-    """Draw HUD overlay: corridor lines, velocity arrow, and title.
+    """Draw minimal HUD overlay: title bar only.
+
+    Red boundary lines and velocity arrow have been removed. The glass-box
+    walls in the MuJoCo scene replace the 2-D corridor overlay, and VLM
+    commands are printed to stdout rather than overlaid on the frame.
 
     Args:
       image: RGB image array (H, W, 3).
-      current_vlm_command: Array [vel_x, vel_y, yaw_rate].
-      camera: Camera name; use 'birds_eye' to avoid obscuring robot (arrow in
-        corner).
+      current_vlm_command: Array [vel_x, vel_y, yaw_rate] (kept for API compat).
+      camera: Camera name (kept for API compat).
 
     Returns:
-      Modified RGB image with HUD overlay.
+      RGB image with title bar only.
     """
     img = cv2.cvtColor(image.copy(), cv2.COLOR_RGB2BGR)
-    h, w = img.shape[:2]
-    red = (0, 0, 255)
-    green = (0, 255, 0)
     white = (255, 255, 255)
 
-    # Authorized corridor: vertical RED lines at 20% and 80% of width
-    x1, x2 = int(w * 0.2), int(w * 0.8)
-    cv2.line(img, (x1, 0), (x1, h), red, 2)
-    cv2.line(img, (x2, 0), (x2, h), red, 2)
-
-    # Velocity arrow: GREEN, from bottom-center, direction (vel_x, vel_y)
-    vel_x = float(current_vlm_command[0])
-    vel_y = float(current_vlm_command[1])
-    scale = 100
-
-    if camera == "birds_eye":
-      # Arrow in top-right corner to avoid obscuring robot in center
-      start = (w - 80, 60)
-      dx = int(vel_y * scale)
-      dy = int(-vel_x * scale)
-    else:
-      # Arrow from bottom-center
-      start = (w // 2, h - 30)
-      dx = int(vel_y * scale)
-      dy = int(-vel_x * scale)
-
-    end = (start[0] + dx, start[1] + dy)
-    cv2.arrowedLine(img, start, end, green, 3, tipLength=0.2)
-
-    # Title overlay
     cv2.putText(
         img,
         "GPT-4o AUTONOMOUS NAV",

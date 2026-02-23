@@ -25,6 +25,13 @@ _xla = os.environ.get("XLA_FLAGS", "") + " --xla_gpu_triton_gemm_any=True"
 os.environ["XLA_FLAGS"] = _xla
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+# Prevent JAX from pre-allocating 75-90% of VRAM
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+# Alternatively, use a safe cap (60% of total VRAM)
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.60'
+# Disable Triton GEMM to prevent some rare WSL2 memory leaks
+os.environ['XLA_FLAGS'] = '--xla_gpu_enable_triton_gemm=false'
+
 import jax
 # Create a local folder to store the "frozen" compiled code
 cache_dir = os.path.join(os.getcwd(), "jax_cache")
@@ -40,6 +47,8 @@ from absl import logging
 from brax.training.agents.ppo import checkpoint as ppo_checkpoint
 from brax.training.agents.ppo import networks as ppo_networks
 from etils import epath
+import math
+
 import jax
 import jax.numpy as jp
 import cv2
@@ -58,8 +67,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="absl")
 
 _ENV_NAME = flags.DEFINE_string(
     "env_name",
-    "Go1JoystickSARStage1",
-    "SAR environment (e.g. Go1JoystickSARStage1).",
+    "Go1JoystickSARStage5",
+    "SAR environment (e.g. Go1JoystickSARStage5).",
 )
 _LOAD_CHECKPOINT_PATH = flags.DEFINE_string(
     "load_checkpoint_path",
@@ -84,14 +93,38 @@ _OUTPUT_VIDEO = flags.DEFINE_string(
 )
 _CAMERA = flags.DEFINE_string(
     "camera",
-    "hero_view",
-    "Camera for output video (hero_view, follow_side, birds_eye).",
+    "birds_eye",
+    "Camera for output video (birds_eye, robot_fpv).",
+)
+_VLM_SWAP_AXES = flags.DEFINE_bool(
+    "vlm_swap_axes",
+    False,
+    "Swap vel_x/vel_y from VLM. VLM is explicitly prompted vel_x=Forward so "
+    "the direct mapping is correct by default. Enable only for debugging.",
+)
+_RUBBLE_SEED = flags.DEFINE_integer(
+    "rubble_seed",
+    42,
+    "Random seed for Stage 5 Gaussian rubble generation.",
+)
+_N_RUBBLE = flags.DEFINE_integer(
+    "n_rubble",
+    120,
+    "Number of rubble pieces for Stage 5 (100-150 recommended).",
 )
 _SEED = flags.DEFINE_integer("seed", 1, "Random seed")
 
 
 def main(argv):
   del argv
+
+  # Procedurally generate Stage 5 rubble before the environment loads
+  # (overwrites scene_mjx_feetonly_sar_stage5.xml with fresh Gaussian layout)
+  if "SARStage5" in _ENV_NAME.value:
+    vlm_bridge.generate_stage5_xml(
+        seed=_RUBBLE_SEED.value,
+        n_rubble=_N_RUBBLE.value,
+    )
 
   # Environment config: override_command=[0,0,0] so we inject VLM commands
   env_cfg = registry.get_default_config(_ENV_NAME.value)
@@ -143,31 +176,91 @@ def main(argv):
   # Rollout loop (Python for-loop: VLM is blocking)
   rng = jax.random.PRNGKey(_SEED.value)
   state = eval_env.reset(rng)
-  current_vlm_command = jp.array([0.0, 0.0, 0.0])
+  # Raw VLM output in world frame (forward=+X, lateral=+Y); updated every VLM query
+  raw_vlm_world = np.array([0.0, 0.0, 0.0])
   trajectory = [state]
-  vlm_commands_per_step = [np.array(jax.device_get(current_vlm_command))]
+
+  # Y-bound for saturation guardrail (soft stop on lateral only)
+  Y_BOUND = 1.45
+  # Hardcoded 90-degree offset: VLM forward → World +X alignment
+  THETA_OFFSET = 0.0
+
+  def _quat_to_yaw(quat: np.ndarray) -> float:
+    """Extract yaw (Z-rotation) from quaternion (w,x,y,z)."""
+    w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+  def _world_to_body_cmd(vx_world: float, vy_world: float, theta: float) -> tuple[float, float]:
+    """Rotate world-frame (forward=+X, lateral=+Y) to body-frame velocities."""
+    c, s = math.cos(theta), math.sin(theta)
+    vx_body = vx_world * c + vy_world * s
+    vy_body = -vx_world * s + vy_world * c
+    return vx_body, vy_body
+
+  def _apply_guardrails_and_rotate(s, raw_world: np.ndarray) -> jax.Array:
+    """Saturation + world-to-body rotation + Automatic Nose-to-Goal Yaw."""
+    qpos = np.array(jax.device_get(s.data.qpos))
+    robot_x, robot_y = float(qpos[0]), float(qpos[1])
+    vx, vy = float(raw_world[0]), float(raw_world[1])
+
+    # 1. Lateral Guardrail (unchanged)
+    if abs(robot_y) > Y_BOUND:
+        if (robot_y > Y_BOUND and vy > 0) or (robot_y < -Y_BOUND and vy < 0):
+            vy = 0.0
+
+    # 2. Calculate Angle to Red Dot (at X=5.0, Y=0.0)
+    dx = 5.0 - robot_x
+    dy = 0.0 - robot_y
+    target_yaw = math.atan2(dy, dx)
+    
+    # 3. Get Current Yaw and calculate error
+    current_yaw = _quat_to_yaw(qpos[3:7])
+    yaw_error = target_yaw - current_yaw
+    yaw_error = (yaw_error + math.pi) % (2 * math.pi) - math.pi # Normalize
+
+    # 4. Rotate Velocities (Theta is the robot's nose direction)
+    theta = current_yaw + THETA_OFFSET
+    vx_body, vy_body = _world_to_body_cmd(vx, vy, theta)
+
+    # 5. Create final command: [fwd, lat, yaw]
+    # We use (yaw_error * 2.0) to steer the nose, plus any delta from the VLM
+    final_yaw_vel = (yaw_error * 0.5) + raw_world[2]
+    
+    return jp.array([vx_body, vy_body, final_yaw_vel])
+
+  vlm_commands_per_step = [np.array(jax.device_get(_apply_guardrails_and_rotate(state, raw_vlm_world)))]
 
   for step_idx in range(_EPISODE_LENGTH.value - 1):
     # Query VLM every N steps
     if step_idx % _VLM_INTERVAL.value == 0:
-      frame = eval_env.render(
+      frame_birds = eval_env.render(
+          state,
+          camera="birds_eye",
+          height=480,
+          width=640,
+      )
+      frame_fpv = eval_env.render(
           state,
           camera="front_vlm",
           height=480,
           width=640,
       )
-      frame = np.array(jax.device_get(frame))
-      result = vlm.get_action(frame)
-      current_vlm_command = jp.array([
-          result["vel_x"],
-          result["vel_y"],
-          result["yaw_rate"],
-      ])
+      frame_birds = np.array(jax.device_get(frame_birds))
+      frame_fpv = np.array(jax.device_get(frame_fpv))
+      frame_dual = np.hstack([frame_birds, frame_fpv])  # 480 x 1280
+      result = vlm.get_action(frame_dual)
+      if _VLM_SWAP_AXES.value:
+        raw_vlm_world = np.array([result["vel_y"], result["vel_x"], result["yaw_rate"]])
+      else:
+        raw_vlm_world = np.array([result["vel_x"], result["vel_y"], result["yaw_rate"]])
       print(
-          f"Step {step_idx}: VLM vel_x={result['vel_x']:.3f} "
-          f"vel_y={result['vel_y']:.3f} yaw_rate={result['yaw_rate']:.3f}"
+          f"Step {step_idx}: VLM → fwd={result['vel_x']:+.3f}  "
+          f"lat={result['vel_y']:+.3f}  yaw={result['yaw_rate']:+.3f}"
       )
+      if result.get("explanation"):
+        print(f"  Explanation: {result['explanation']}")
 
+    current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
     vlm_commands_per_step.append(np.array(jax.device_get(current_vlm_command)))
 
     # Immutable state update (JAX)
@@ -202,25 +295,34 @@ def main(argv):
     vlm_commands_subset = vlm_commands_per_step[::render_every]
 
     scene_option = mujoco.MjvOption()
-    scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
+    # Enable transparency so glass boundary walls render with alpha < 1
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True
     scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
     scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
 
-    raw_frames = eval_env.render(
+    raw_frames_birds = eval_env.render(
         traj_subset,
         height=480,
         width=640,
-        camera=_CAMERA.value,
+        camera="birds_eye",
+        scene_option=scene_option,
+    )
+    raw_frames_fpv = eval_env.render(
+        traj_subset,
+        height=480,
+        width=640,
+        camera="front_vlm",
         scene_option=scene_option,
     )
 
-    # Apply HUD overlay to each frame (corridor lines, velocity arrow, title)
-    camera_name = _CAMERA.value or "hero_view"
+    # Concatenate birds_eye | front_vlm → 480 x 1280, apply title-only HUD
     frames_with_hud = []
-    for i, frame in enumerate(raw_frames):
-      frame_np = np.array(jax.device_get(frame))
+    for i in range(len(traj_subset)):
+      frame_birds = np.array(jax.device_get(raw_frames_birds[i]))
+      frame_fpv = np.array(jax.device_get(raw_frames_fpv[i]))
+      wide_frame = np.hstack([frame_birds, frame_fpv])
       cmd = vlm_commands_subset[i] if i < len(vlm_commands_subset) else vlm_commands_subset[-1]
-      frame_with_hud = vlm.draw_hud(frame_np, cmd, camera=camera_name)
+      frame_with_hud = vlm.draw_hud(wide_frame, cmd, camera="birds_eye")
       frames_with_hud.append(frame_with_hud)
 
     media.write_video(str(output_path), frames_with_hud, fps=fps)
