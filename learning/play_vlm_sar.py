@@ -32,6 +32,11 @@ os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.60'
 # Disable Triton GEMM to prevent some rare WSL2 memory leaks
 os.environ['XLA_FLAGS'] = '--xla_gpu_enable_triton_gemm=false'
 
+# Orbax 0.7+ compatibility: bridge legacy Brax (PyTreeCheckpointer) to 2026 API
+import orbax.checkpoint as ocp
+if not hasattr(ocp, 'PyTreeCheckpointer'):
+    ocp.PyTreeCheckpointer = lambda: ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
+
 import jax
 # Create a local folder to store the "frozen" compiled code
 cache_dir = os.path.join(os.getcwd(), "jax_cache")

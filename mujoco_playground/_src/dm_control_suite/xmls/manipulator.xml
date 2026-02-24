@@ -61,7 +61,7 @@
 
   <worldbody>
     <!-- Arena -->
-    <light name="light" directional="true" diffuse=".6 .6 .6" pos="0 0 1" specular=".3 .3 .3"/>
+    <light name="light" type="directional" diffuse=".6 .6 .6" pos="0 0 1" specular=".3 .3 .3"/>
     <geom name="floor" type="plane" pos="0 0 0" size=".4 .2 10" material="grid"/>
     <geom name="wall1" type="plane" pos="-.682843 0 .282843" size=".4 .2 10" material="grid" zaxis="1 0 1"/>
     <geom name="wall2" type="plane" pos=".682843 0 .282843" size=".4 .2 10" material="grid" zaxis="-1 0 1"/>

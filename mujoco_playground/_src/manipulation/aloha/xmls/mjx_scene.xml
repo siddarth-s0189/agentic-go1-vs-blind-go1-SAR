@@ -53,7 +53,7 @@
   </default>
 
   <worldbody>
-    <light pos="0 0 3" dir="0 0 -1" directional="true"/>
+    <light pos="0 0 3" dir="0 0 -1" type="directional"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" pos="0 0 -.75" contype="0" conaffinity="0"/>
     <site name="worldref" pos="0 0 -0.75"/>
     <geom mesh="tabletop" material="table" class="visual" pos="0 0 -0.75" quat="1 0 0 1"/>

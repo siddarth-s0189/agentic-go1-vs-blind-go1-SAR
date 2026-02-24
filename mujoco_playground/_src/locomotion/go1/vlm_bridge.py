@@ -140,7 +140,7 @@ def generate_stage5_xml(seed: int = 42, n_rubble: int = 120) -> str:
   </asset>
 
   <worldbody>
-    <light pos="0 0 5" dir="0 0 -1" directional="true" castshadow="true"/>
+    <light pos="0 0 5" dir="0 0 -1" type="directional" castshadow="true"/>
     <geom name="floor" type="hfield" hfield="hfield" material="groundplane" contype="1" conaffinity="0" priority="1"
       friction="1.0"/>
 

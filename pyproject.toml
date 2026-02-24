@@ -9,7 +9,7 @@ readme = "README.md"
 authors = [
     {name = "Google DeepMind", email = "mujoco@deepmind.com"},
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dynamic = ["description"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -24,17 +24,17 @@ classifiers = [
 ]
 dependencies = [
     "absl-py",
-    "brax>=0.12.5",
+    "brax",
     "etils",
     "flax",
     "jax",
     "lxml",
     "mediapy",
     "ml_collections",
-    "mujoco-mjx>=3.4.dev",
-    "mujoco>=3.4.dev",
-    "warp-lang>=1.11",
-    "orbax-checkpoint>=0.11.22",
+    "mujoco-mjx",
+    "mujoco",
+    "warp-lang",
+    "orbax-checkpoint",
     "tqdm",
 ]
 keywords = ["mjx", "mujoco", "sim2real", "reinforcement learning"]
@@ -79,7 +79,7 @@ dev = [
     "pytest-xdist",
 ]
 learning = [
-    "rsl-rl-lib>=3.0.0",
+    "rsl-rl-lib",
     "wandb",
 ]
 all = [
