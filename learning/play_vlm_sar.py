@@ -44,6 +44,7 @@ os.makedirs(cache_dir, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", cache_dir)
 
 import contextlib
+import cv2
 import functools
 import gc
 import json
@@ -388,6 +389,14 @@ def main(argv):
                 "LATERALLY to clear the obstruction."
             )
 
+          cv2.imwrite(
+              "vlm_debug_input.jpg",
+              cv2.cvtColor(vlm_frame, cv2.COLOR_RGB2BGR),
+          )
+          print(
+              f"DEBUG: vlm_frame pixel range: {vlm_frame.min()} to {vlm_frame.max()}"
+          )
+
           result = vlm.get_action(
               vlm_frame,
               physical_feedback=physical_feedback,
@@ -405,7 +414,7 @@ def main(argv):
                 [result["vel_y"], -result["vel_x"], result["yaw_rate"]]
             )
           else:
-            # Negate vel_y: VLM uses +Y=Right, MuJoCo Playground uses +Y=Left
+            # Negate vel_y: VLM uses -Y=Left/+Y=Right → MuJoCo +Y=Left/-Y=Right
             raw_vlm_world = np.array(
                 [result["vel_x"], -result["vel_y"], result["yaw_rate"]]
             )
