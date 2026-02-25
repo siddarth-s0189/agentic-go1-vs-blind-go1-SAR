@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 import torch
-from transformers import AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq, AutoProcessor
 
 class OpenVLABridge:
     def __init__(self, device="cuda", dtype="bf16"):
