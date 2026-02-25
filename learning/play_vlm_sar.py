@@ -134,6 +134,9 @@ _N_RUBBLE = flags.DEFINE_integer(
 _SEED = flags.DEFINE_integer("seed", 1, "Random seed")
 
 
+RENDER_EVERY = 5  # Frames between video renders (decoupled from VLM interval)
+
+
 def main(argv):
   del argv
 
@@ -191,6 +194,10 @@ def main(argv):
   rng = jax.random.PRNGKey(_SEED.value)
   state = eval_env.reset(rng)
 
+  # Override starting orientation to face East (+X), so FPV points at target (5, 0) from step 0
+  new_qpos = state.data.qpos.at[3:7].set(jp.array([1.0, 0.0, 0.0, 0.0]))
+  state = state.replace(data=state.data.replace(qpos=new_qpos))
+
   # Jit-ed step: obs update + policy + env.step in one opaque call (avoids recompile)
   is_dict_obs = isinstance(state.obs, dict)
 
@@ -230,11 +237,24 @@ def main(argv):
     vy_body = -vx_world * s + vy_world * c
     return vx_body, vy_body
 
+  # Proprioceptive stuck detector: count steps where VLM requests forward but robot barely moves
+  stuck_step_count = [0]
+
   def _apply_guardrails_and_rotate(s, raw_world: np.ndarray) -> jax.Array:
     """Saturation + world-to-body rotation + Automatic Nose-to-Goal Yaw."""
     qpos = np.array(jax.device_get(s.data.qpos))
     robot_x, robot_y = float(qpos[0]), float(qpos[1])
     vx, vy = float(raw_world[0]), float(raw_world[1])
+
+    # 0. Lightweight proprioceptive check: detect when VLM commands fail physically
+    qvel_xy = np.array(jax.device_get(s.data.qvel[:2]))
+    actual_speed = float(np.linalg.norm(qvel_xy))
+    if vx > 0.2 and actual_speed < 0.05:
+      stuck_step_count[0] += 1
+      if stuck_step_count[0] == 11:  # First time we exceed 10 steps
+        print("PROPRIOCEPTION: Robot stuck against obstacle.")
+    else:
+      stuck_step_count[0] = 0
 
     # 1. Lateral Guardrail (unchanged)
     if abs(robot_y) > Y_BOUND:
@@ -261,22 +281,28 @@ def main(argv):
     
     return jp.array([vx_body, vy_body, final_yaw_vel])
 
+  def _robot_is_stuck() -> bool:
+    return stuck_step_count[0] > 10
+
   vlm_commands_per_step = [np.array(jax.device_get(_apply_guardrails_and_rotate(state, raw_vlm_world)))]
 
   if _VISION_MODE.value == "none":
     print("Vision mode: none (Blind) — VLM calls skipped, using zero command + guardrails.")
 
   # Streaming video: 640x480 per camera, write to disk during rollout (no RAM buildup)
-  # Frames only at VLM steps (avoids wasting time on unused frames)
+  # Rendering decoupled from VLM interval via RENDER_EVERY
   render_h, render_w = 480, 640  # Fixed lower resolution for memory-constrained hardware
-  fps = 1.0 / eval_env.dt / _VLM_INTERVAL.value
+  fps = 1.0 / (eval_env.dt * RENDER_EVERY)
   scene_option = mujoco.MjvOption()
   scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True
   scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
   scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
 
   def _render_frame(s, cmd):
-    """Render birds_eye | front_vlm with HUD overlay at fixed 640x480 per view."""
+    """Render birds_eye | front_vlm with HUD overlay at fixed 640x480 per view.
+
+    front_vlm uses xyaxes for 20° down tilt and correct orientation (no 90° roll).
+    """
     raw_birds = eval_env.render(
         s, height=render_h, width=render_w, camera="birds_eye", scene_option=scene_option
     )
@@ -315,6 +341,7 @@ def main(argv):
       if writer is not None:
         cmd = vlm_commands_per_step[_safe_cmd_idx(0)]
         img = _render_frame(state, cmd)
+        img = np.array(jax.device_get(img)).astype(np.uint8)
         writer.add_image(img)
         del img
         gc.collect()
@@ -349,17 +376,38 @@ def main(argv):
             vlm_frame = np.hstack([frame_birds, frame_fpv])
             del frame_birds, frame_fpv
 
-          result = vlm.get_action(vlm_frame)
+          print(
+              f"VLM Vision Mode: {_VISION_MODE.value} | Sending frame shape: {vlm_frame.shape}"
+          )
+
+          physical_feedback = None
+          if _robot_is_stuck():
+            physical_feedback = (
+                "PHYSICAL FEEDBACK: The robot is currently STUCK and not moving "
+                "forward despite your commands. You must YAW (turn) or move "
+                "LATERALLY to clear the obstruction."
+            )
+
+          result = vlm.get_action(
+              vlm_frame,
+              physical_feedback=physical_feedback,
+              vision_mode=_VISION_MODE.value,
+          )
+
+          if physical_feedback is not None:
+            stuck_step_count[0] = 0  # Reset immediately after query sent
+
           del vlm_frame
           gc.collect()
 
           if _VLM_SWAP_AXES.value:
             raw_vlm_world = np.array(
-                [result["vel_y"], result["vel_x"], result["yaw_rate"]]
+                [result["vel_y"], -result["vel_x"], result["yaw_rate"]]
             )
           else:
+            # Negate vel_y: VLM uses +Y=Right, MuJoCo Playground uses +Y=Left
             raw_vlm_world = np.array(
-                [result["vel_x"], result["vel_y"], result["yaw_rate"]]
+                [result["vel_x"], -result["vel_y"], result["yaw_rate"]]
             )
 
           # Stream VLM response to disk (no RAM accumulation)
@@ -388,11 +436,12 @@ def main(argv):
         vlm_cmd_jax = jp.array(jax.device_get(current_vlm_command))
         state, rng = jit_step_with_command(state, vlm_cmd_jax, rng)
 
-        # Render for video only at VLM steps (avoids wasting time on unused frames)
-        if writer is not None and step_idx % _VLM_INTERVAL.value == 0:
+        # Render for video every RENDER_EVERY steps (decoupled from VLM interval)
+        if writer is not None and step_idx % RENDER_EVERY == 0:
           cmd_idx = _safe_cmd_idx(step_idx + 1)
           cmd = vlm_commands_per_step[cmd_idx]
           img = _render_frame(state, cmd)
+          img = np.array(jax.device_get(img)).astype(np.uint8)
           writer.add_image(img)
           del img
           gc.collect()

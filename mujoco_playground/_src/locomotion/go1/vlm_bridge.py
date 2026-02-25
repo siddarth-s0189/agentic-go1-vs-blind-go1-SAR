@@ -202,11 +202,20 @@ class GPT4pVLM:
     _, jpeg_bytes = cv2.imencode(".jpg", bgr)
     return base64.b64encode(jpeg_bytes.tobytes()).decode("utf-8")
 
-  def get_action(self, image: np.ndarray) -> Dict:
-    """Get navigation command from GPT-4o vision based on the dual-view frame.
+  def get_action(
+      self,
+      image: np.ndarray,
+      physical_feedback: str | None = None,
+      vision_mode: str = "combined",
+  ) -> Dict:
+    """Get navigation command from GPT-4o vision based on the frame(s).
 
     Args:
-      image: RGB image array (480 x 1280): left=Top-Down Drone, right=First-Person.
+      image: RGB image array. Shape depends on vision_mode: (H, W) for single
+        view, (H, 2*W) for combined (birds_eye | fpv).
+      physical_feedback: Optional proprioceptive feedback to append to the
+        prompt (e.g. "Robot is stuck").
+      vision_mode: One of "fpv", "birds_eye", "combined". Used for prompt context.
 
     Returns:
       Dict with vel_x, vel_y, yaw_rate, explanation. On API failure, returns
@@ -216,19 +225,34 @@ class GPT4pVLM:
 
     try:
       base64_str = self.encode_image(image)
+      user_text = "Analyze this frame and provide navigation."
+      if physical_feedback:
+        user_text += f" {physical_feedback}"
+
       response = self._client.chat.completions.create(
           model=self._model,
           messages=[
               {
                   "role": "system",
                   "content": (
-                      "You are an expert navigator for a Go1 quadruped. You are "
-                      "receiving a dual-feed: the Left image is a Top-Down Drone "
-                      "view; the Right image is your First-Person view. "
+                      "You are an expert navigator for a Go1 quadruped. "
+                      "You may receive a combined view (Birds-Eye View on the "
+                      "left, FPV on the right), or just one of the two. "
+                      "When the Birds-Eye View is available, use it as your "
+                      "GLOBAL MAP to identify the clearest path to the goal "
+                      "(Red Dot) across the whole field. "
+                      "Use the FPV view for IMMEDIATE depth and to avoid "
+                      "obstacles directly in your path. "
+                      "If the Birds-Eye View shows a clear path on the LEFT, "
+                      "do not move RIGHT just because the FPV view is intuitive. "
+                      "Trust the map for long-term planning. "
                       "- Navigation: The navigable corridor is Y = -1.5 to 1.5. "
                       "Stay centered. "
                       "- Strategy: Walk over small debris, but navigate around "
                       "blocks taller than your knees. "
+                      "- Lateral velocity (vel_y) commands should be between "
+                      "0.3 and 0.6 for significant obstacle avoidance maneuvers; "
+                      "0.1 is too subtle for the gait policy. "
                       "- Goal: Your destination is the red marker at the far end "
                       "of the field (World +X). "
                       "- Output: Respond ONLY with a JSON object: "
@@ -241,7 +265,7 @@ class GPT4pVLM:
                   "content": [
                       {
                           "type": "text",
-                          "text": "Analyze this dual-view frame and provide navigation.",
+                          "text": user_text,
                       },
                       {
                           "type": "image_url",
