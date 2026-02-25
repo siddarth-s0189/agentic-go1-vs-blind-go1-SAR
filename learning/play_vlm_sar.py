@@ -108,6 +108,13 @@ _CAMERA = flags.DEFINE_string(
     "birds_eye",
     "Camera for output video (birds_eye, robot_fpv).",
 )
+_VISION_MODE = flags.DEFINE_enum(
+    "vision_mode",
+    "combined",
+    ["none", "fpv", "birds_eye", "combined"],
+    "VLM input: none=blind (skip VLM), fpv=first-person only, birds_eye=top-down only, "
+    "combined=side-by-side birds_eye|fpv. Video always shows side-by-side.",
+)
 _VLM_SWAP_AXES = flags.DEFINE_bool(
     "vlm_swap_axes",
     False,
@@ -182,7 +189,7 @@ def main(argv):
   )
   jit_inference_fn = jax.jit(inference_fn)
 
-  # VLM
+  # VLM (used for inference when vision_mode != none; always for video HUD)
   vlm = vlm_bridge.GPT4pVLM()
 
   # Rollout loop (Python for-loop: VLM is blocking)
@@ -240,6 +247,9 @@ def main(argv):
     return jp.array([vx_body, vy_body, final_yaw_vel])
 
   vlm_commands_per_step = [np.array(jax.device_get(_apply_guardrails_and_rotate(state, raw_vlm_world)))]
+
+  if _VISION_MODE.value == "none":
+    print("Vision mode: none (Blind) — VLM calls skipped, using zero command + guardrails.")
 
   # Streaming video: 640x480 per camera, write to disk during rollout (no RAM buildup)
   render_every = 2
@@ -299,20 +309,33 @@ def main(argv):
         if step_idx > 0 and step_idx % 100 == 0:
           jax.clear_caches()
 
-        # Query VLM every N steps
-        if step_idx % _VLM_INTERVAL.value == 0:
-          frame_birds = eval_env.render(
-              state, camera="birds_eye", height=render_h, width=render_w
-          )
-          frame_fpv = eval_env.render(
-              state, camera="front_vlm", height=render_h, width=render_w
-          )
-          frame_birds = np.array(jax.device_get(frame_birds))
-          frame_fpv = np.array(jax.device_get(frame_fpv))
-          frame_dual = np.hstack([frame_birds, frame_fpv])
-          del frame_birds, frame_fpv
-          result = vlm.get_action(frame_dual)
-          del frame_dual
+        # Query VLM every N steps (skip when vision_mode=none)
+        if step_idx % _VLM_INTERVAL.value == 0 and _VISION_MODE.value != "none":
+          vlm_frame = None
+          if _VISION_MODE.value == "fpv":
+            frame_fpv = eval_env.render(
+                state, camera="front_vlm", height=render_h, width=render_w
+            )
+            vlm_frame = np.array(jax.device_get(frame_fpv))
+          elif _VISION_MODE.value == "birds_eye":
+            frame_birds = eval_env.render(
+                state, camera="birds_eye", height=render_h, width=render_w
+            )
+            vlm_frame = np.array(jax.device_get(frame_birds))
+          else:  # combined
+            frame_birds = eval_env.render(
+                state, camera="birds_eye", height=render_h, width=render_w
+            )
+            frame_fpv = eval_env.render(
+                state, camera="front_vlm", height=render_h, width=render_w
+            )
+            frame_birds = np.array(jax.device_get(frame_birds))
+            frame_fpv = np.array(jax.device_get(frame_fpv))
+            vlm_frame = np.hstack([frame_birds, frame_fpv])
+            del frame_birds, frame_fpv
+
+          result = vlm.get_action(vlm_frame)
+          del vlm_frame
           gc.collect()
 
           if _VLM_SWAP_AXES.value:
