@@ -43,7 +43,10 @@ cache_dir = os.path.join(os.getcwd(), "jax_cache")
 os.makedirs(cache_dir, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", cache_dir)
 
+import contextlib
 import functools
+import gc
+import json
 import warnings
 
 from absl import app
@@ -56,7 +59,6 @@ import math
 
 import jax
 import jax.numpy as jp
-import cv2
 import mediapy as media
 import mujoco
 import numpy as np
@@ -95,6 +97,11 @@ _OUTPUT_VIDEO = flags.DEFINE_string(
     "output_video",
     None,
     "Output path for rollout video (e.g. vlm_rollout.mp4).",
+)
+_VLM_LOG = flags.DEFINE_string(
+    "vlm_log",
+    None,
+    "Output path for VLM responses log (.jsonl). Streams to disk to avoid RAM buildup.",
 )
 _CAMERA = flags.DEFINE_string(
     "camera",
@@ -183,7 +190,6 @@ def main(argv):
   state = eval_env.reset(rng)
   # Raw VLM output in world frame (forward=+X, lateral=+Y); updated every VLM query
   raw_vlm_world = np.array([0.0, 0.0, 0.0])
-  trajectory = [state]
 
   # Y-bound for saturation guardrail (soft stop on lateral only)
   Y_BOUND = 1.45
@@ -235,103 +241,145 @@ def main(argv):
 
   vlm_commands_per_step = [np.array(jax.device_get(_apply_guardrails_and_rotate(state, raw_vlm_world)))]
 
-  for step_idx in range(_EPISODE_LENGTH.value - 1):
-    # Query VLM every N steps
-    if step_idx % _VLM_INTERVAL.value == 0:
-      frame_birds = eval_env.render(
-          state,
-          camera="birds_eye",
-          height=480,
-          width=640,
-      )
-      frame_fpv = eval_env.render(
-          state,
-          camera="front_vlm",
-          height=480,
-          width=640,
-      )
-      frame_birds = np.array(jax.device_get(frame_birds))
-      frame_fpv = np.array(jax.device_get(frame_fpv))
-      frame_dual = np.hstack([frame_birds, frame_fpv])  # 480 x 1280
-      result = vlm.get_action(frame_dual)
-      if _VLM_SWAP_AXES.value:
-        raw_vlm_world = np.array([result["vel_y"], result["vel_x"], result["yaw_rate"]])
-      else:
-        raw_vlm_world = np.array([result["vel_x"], result["vel_y"], result["yaw_rate"]])
-      print(
-          f"Step {step_idx}: VLM → fwd={result['vel_x']:+.3f}  "
-          f"lat={result['vel_y']:+.3f}  yaw={result['yaw_rate']:+.3f}"
-      )
-      if result.get("explanation"):
-        print(f"  Explanation: {result['explanation']}")
+  # Streaming video: 640x480 per camera, write to disk during rollout (no RAM buildup)
+  render_every = 2
+  render_h, render_w = 480, 640  # Fixed lower resolution for memory-constrained hardware
+  fps = 1.0 / eval_env.dt / render_every
+  scene_option = mujoco.MjvOption()
+  scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True
+  scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
+  scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
 
-    current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
-    vlm_commands_per_step.append(np.array(jax.device_get(current_vlm_command)))
-
-    # Immutable state update (JAX)
-    state = state.replace(
-        info={**state.info, "command": current_vlm_command}
+  def _render_frame(s, cmd):
+    """Render birds_eye | front_vlm with HUD overlay at fixed 640x480 per view."""
+    raw_birds = eval_env.render(
+        s, height=render_h, width=render_w, camera="birds_eye", scene_option=scene_option
     )
+    raw_fpv = eval_env.render(
+        s, height=render_h, width=render_w, camera="front_vlm", scene_option=scene_option
+    )
+    frame_birds = np.array(jax.device_get(raw_birds))
+    frame_fpv = np.array(jax.device_get(raw_fpv))
+    wide_frame = np.hstack([frame_birds, frame_fpv])
+    return vlm.draw_hud(wide_frame, cmd, camera="birds_eye")
 
-    # Safely update the observation whether it's a Dict or a flat Array
-    if isinstance(state.obs, dict):
-      new_val = state.obs["state"].at[45:48].set(current_vlm_command)
-      state = state.replace(obs={**state.obs, "state": new_val})
-    else:
-      new_val = state.obs.at[45:48].set(current_vlm_command)
-      state = state.replace(obs=new_val)
+  def _safe_cmd_idx(step: int) -> int:
+    """Safe index into vlm_commands_per_step to prevent IndexError."""
+    n = len(vlm_commands_per_step)
+    return min(step, n - 1) if n > 0 else 0
 
-    # Policy action and step
-    rng, act_key = jax.random.split(rng)
-    action = jit_inference_fn(state.obs, act_key)[0]
-    state = eval_env.step(state, action)
-    trajectory.append(state)
-
-  print("Rollout complete.")
-
-  # Save video with HUD overlay
+  # VideoWriter context: wraps entire rollout for proper cleanup on physics errors
   if _OUTPUT_VIDEO.value:
     output_path = Path(_OUTPUT_VIDEO.value)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    render_every = 2
-    fps = 1.0 / eval_env.dt / render_every
-    traj_subset = trajectory[::render_every]
-    vlm_commands_subset = vlm_commands_per_step[::render_every]
-
-    scene_option = mujoco.MjvOption()
-    # Enable transparency so glass boundary walls render with alpha < 1
-    scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True
-    scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
-    scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
-
-    raw_frames_birds = eval_env.render(
-        traj_subset,
-        height=480,
-        width=640,
-        camera="birds_eye",
-        scene_option=scene_option,
+    video_ctx = media.VideoWriter(
+        str(output_path), shape=(render_h, render_w * 2), fps=fps
     )
-    raw_frames_fpv = eval_env.render(
-        traj_subset,
-        height=480,
-        width=640,
-        camera="front_vlm",
-        scene_option=scene_option,
-    )
+  else:
+    video_ctx = contextlib.nullcontext()
 
-    # Concatenate birds_eye | front_vlm → 480 x 1280, apply title-only HUD
-    frames_with_hud = []
-    for i in range(len(traj_subset)):
-      frame_birds = np.array(jax.device_get(raw_frames_birds[i]))
-      frame_fpv = np.array(jax.device_get(raw_frames_fpv[i]))
-      wide_frame = np.hstack([frame_birds, frame_fpv])
-      cmd = vlm_commands_subset[i] if i < len(vlm_commands_subset) else vlm_commands_subset[-1]
-      frame_with_hud = vlm.draw_hud(wide_frame, cmd, camera="birds_eye")
-      frames_with_hud.append(frame_with_hud)
+  vlm_log_file = None
+  if _VLM_LOG.value:
+    vlm_log_path = Path(_VLM_LOG.value)
+    vlm_log_path.parent.mkdir(parents=True, exist_ok=True)
+    vlm_log_file = open(vlm_log_path, "w", encoding="utf-8")
 
-    media.write_video(str(output_path), frames_with_hud, fps=fps)
-    print(f"Video saved: {output_path}")
+  try:
+    with video_ctx as writer:
+      # Write initial frame
+      if writer is not None:
+        cmd = vlm_commands_per_step[_safe_cmd_idx(0)]
+        img = _render_frame(state, cmd)
+        writer.add_image(img)
+        del img
+        gc.collect()
+
+      for step_idx in range(_EPISODE_LENGTH.value - 1):
+        # JAX: clear compilation caches every 100 steps to prevent bloat
+        if step_idx > 0 and step_idx % 100 == 0:
+          jax.clear_caches()
+
+        # Query VLM every N steps
+        if step_idx % _VLM_INTERVAL.value == 0:
+          frame_birds = eval_env.render(
+              state, camera="birds_eye", height=render_h, width=render_w
+          )
+          frame_fpv = eval_env.render(
+              state, camera="front_vlm", height=render_h, width=render_w
+          )
+          frame_birds = np.array(jax.device_get(frame_birds))
+          frame_fpv = np.array(jax.device_get(frame_fpv))
+          frame_dual = np.hstack([frame_birds, frame_fpv])
+          del frame_birds, frame_fpv
+          result = vlm.get_action(frame_dual)
+          del frame_dual
+          gc.collect()
+
+          if _VLM_SWAP_AXES.value:
+            raw_vlm_world = np.array(
+                [result["vel_y"], result["vel_x"], result["yaw_rate"]]
+            )
+          else:
+            raw_vlm_world = np.array(
+                [result["vel_x"], result["vel_y"], result["yaw_rate"]]
+            )
+
+          # Stream VLM response to disk (no RAM accumulation)
+          if vlm_log_file is not None:
+            log_entry = {
+                "step": step_idx,
+                "vel_x": result["vel_x"],
+                "vel_y": result["vel_y"],
+                "yaw_rate": result["yaw_rate"],
+                "explanation": result.get("explanation", ""),
+            }
+            vlm_log_file.write(json.dumps(log_entry) + "\n")
+            vlm_log_file.flush()
+
+          print(
+              f"Step {step_idx}: VLM → fwd={result['vel_x']:+.3f}  "
+              f"lat={result['vel_y']:+.3f}  yaw={result['yaw_rate']:+.3f}"
+          )
+          if result.get("explanation"):
+            print(f"  Explanation: {result['explanation']}")
+
+        current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
+        vlm_commands_per_step.append(np.array(jax.device_get(current_vlm_command)))
+
+        # Immutable state update (JAX)
+        state = state.replace(
+            info={**state.info, "command": current_vlm_command}
+        )
+
+        # Safely update the observation whether it's a Dict or a flat Array
+        if isinstance(state.obs, dict):
+          new_val = state.obs["state"].at[45:48].set(current_vlm_command)
+          state = state.replace(obs={**state.obs, "state": new_val})
+        else:
+          new_val = state.obs.at[45:48].set(current_vlm_command)
+          state = state.replace(obs=new_val)
+
+        # Policy action and step
+        rng, act_key = jax.random.split(rng)
+        action = jit_inference_fn(state.obs, act_key)[0]
+        state = eval_env.step(state, action)
+
+        # Stream frame to video (avoids RAM buildup)
+        if writer is not None and (step_idx + 1) % render_every == 0:
+          cmd_idx = _safe_cmd_idx(step_idx + 1)
+          cmd = vlm_commands_per_step[cmd_idx]
+          img = _render_frame(state, cmd)
+          writer.add_image(img)
+          del img
+          gc.collect()
+
+  finally:
+    if vlm_log_file is not None:
+      vlm_log_file.close()
+    if _OUTPUT_VIDEO.value:
+      print(f"Video saved: {Path(_OUTPUT_VIDEO.value)}")
+
+  print("Rollout complete.")
 
 
 def run():
