@@ -44,7 +44,6 @@ os.makedirs(cache_dir, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", cache_dir)
 
 import contextlib
-import cv2
 import functools
 import gc
 import json
@@ -67,6 +66,7 @@ import numpy as np
 from mujoco_playground import registry
 from mujoco_playground.config import locomotion_params
 from mujoco_playground._src.locomotion.go1 import vlm_bridge
+from mujoco_playground._src.locomotion.go1 import vla_bridge
 
 logging.set_verbosity(logging.WARNING)
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="jax")
@@ -104,17 +104,10 @@ _VLM_LOG = flags.DEFINE_string(
     None,
     "Output path for VLM responses log (.jsonl). Streams to disk to avoid RAM buildup.",
 )
-_CAMERA = flags.DEFINE_string(
-    "camera",
-    "birds_eye",
-    "Camera for output video (birds_eye, robot_fpv).",
-)
-_VISION_MODE = flags.DEFINE_enum(
-    "vision_mode",
-    "combined",
-    ["none", "fpv", "birds_eye", "combined"],
-    "VLM input: none=blind (skip VLM), fpv=first-person only, birds_eye=top-down only, "
-    "combined=side-by-side birds_eye|fpv. Video always shows side-by-side.",
+_SKIP_VLM = flags.DEFINE_bool(
+    "skip_vlm",
+    False,
+    "VLA-only baseline: bypass VLM, use static instruction with VLA on FPV every step.",
 )
 _VLM_SWAP_AXES = flags.DEFINE_bool(
     "vlm_swap_axes",
@@ -133,6 +126,12 @@ _N_RUBBLE = flags.DEFINE_integer(
     "Number of rubble pieces for Stage 5 (100-150 recommended).",
 )
 _SEED = flags.DEFINE_integer("seed", 1, "Random seed")
+_ARCHITECTURE = flags.DEFINE_enum(
+    "architecture",
+    "proxy",
+    ["proxy", "hybrid"],
+    "proxy=VLM-only Soloist; hybrid=VLM strategist + VLA pilot.",
+)
 
 
 RENDER_EVERY = 5  # Frames between video renders (decoupled from VLM interval)
@@ -217,9 +216,20 @@ def main(argv):
   jit_step_with_command = jax.jit(_step_with_command)
 
   # VLM (used for inference when vision_mode != none; always for video HUD)
-  vlm = vlm_bridge.GPT4pVLM()
-  # Raw VLM output in world frame (forward=+X, lateral=+Y); updated every VLM query
+  vlm = vlm_bridge.GPT4pVLM(architecture=_ARCHITECTURE.value)
+  # Raw VLM output in world frame (forward=+X, lateral=+Y); updated every VLM query (proxy only)
   raw_vlm_world = np.array([0.0, 0.0, 0.0])
+
+  # Hybrid / skip_vlm: VLA pilot + strategic instruction
+  vla = None
+  current_strategic_instruction = ["Proceed forward carefully"]  # List for mutability in loop
+  if _ARCHITECTURE.value == "hybrid" or _SKIP_VLM.value:
+    vla = vla_bridge.OpenVLABridge()
+    if _SKIP_VLM.value:
+      current_strategic_instruction[0] = "Navigate forward and avoid obstacles."
+      print("VLA-only baseline: skipping VLM, using static instruction with VLA on FPV.")
+    else:
+      print("Architecture: hybrid (VLM=BEV @60 steps, VLA=FPV @1 step)")
 
   # Y-bound for saturation guardrail (soft stop on lateral only)
   Y_BOUND = 1.45
@@ -285,10 +295,15 @@ def main(argv):
   def _robot_is_stuck() -> bool:
     return stuck_step_count[0] > 10
 
-  vlm_commands_per_step = [np.array(jax.device_get(_apply_guardrails_and_rotate(state, raw_vlm_world)))]
+  # Initial command: proxy uses guardrails; hybrid/skip_vlm use VLA + clip (no rotation)
+  if _ARCHITECTURE.value == "hybrid" or _SKIP_VLM.value:
+    frame0 = eval_env.render(state, camera="front_vlm", height=480, width=640)
+    frame0 = np.array(jax.device_get(frame0))
+    init_cmd = vla.get_vla_action(frame0, current_strategic_instruction[0])
+    vlm_commands_per_step = [np.clip(np.array(jax.device_get(init_cmd)), -1.0, 1.0)]
+  else:
+    vlm_commands_per_step = [np.array(jax.device_get(_apply_guardrails_and_rotate(state, raw_vlm_world)))]
 
-  if _VISION_MODE.value == "none":
-    print("Vision mode: none (Blind) — VLM calls skipped, using zero command + guardrails.")
 
   # Streaming video: 640x480 per camera, write to disk during rollout (no RAM buildup)
   # Rendering decoupled from VLM interval via RENDER_EVERY
@@ -347,98 +362,93 @@ def main(argv):
         del img
         gc.collect()
 
-      for step_idx in range(_EPISODE_LENGTH.value - 1):
-        # JAX: clear compilation caches every 100 steps to prevent bloat
-        if step_idx > 0 and step_idx % 100 == 0:
-          jax.clear_caches()
+      try:
+        for step_idx in range(_EPISODE_LENGTH.value - 1):
+          # JAX: clear compilation caches every 100 steps to prevent bloat
+          if step_idx > 0 and step_idx % 100 == 0:
+            jax.clear_caches()
 
-        # Query VLM every N steps (skip when vision_mode=none)
-        if step_idx % _VLM_INTERVAL.value == 0 and _VISION_MODE.value != "none":
-          vlm_frame = None
-          if _VISION_MODE.value == "fpv":
-            frame_fpv = eval_env.render(
-                state, camera="front_vlm", height=render_h, width=render_w
-            )
-            vlm_frame = np.array(jax.device_get(frame_fpv))
-          elif _VISION_MODE.value == "birds_eye":
-            frame_birds = eval_env.render(
+          # Query VLM every N steps (skip when --skip_vlm for VLA-only baseline)
+          # Architecture handles routing: VLM always gets birds_eye (proxy & hybrid)
+          if step_idx % _VLM_INTERVAL.value == 0 and not _SKIP_VLM.value:
+            vlm_frame = np.array(jax.device_get(eval_env.render(
                 state, camera="birds_eye", height=render_h, width=render_w
+            )))
+            print(
+                f"Step {step_idx} | Arch: {_ARCHITECTURE.value} | VLM frame: {vlm_frame.shape}"
             )
-            vlm_frame = np.array(jax.device_get(frame_birds))
-          else:  # combined
-            frame_birds = eval_env.render(
-                state, camera="birds_eye", height=render_h, width=render_w
-            )
-            frame_fpv = eval_env.render(
-                state, camera="front_vlm", height=render_h, width=render_w
-            )
-            frame_birds = np.array(jax.device_get(frame_birds))
-            frame_fpv = np.array(jax.device_get(frame_fpv))
-            vlm_frame = np.hstack([frame_birds, frame_fpv])
-            del frame_birds, frame_fpv
 
-          print(
-              f"VLM Vision Mode: {_VISION_MODE.value} | Sending frame shape: {vlm_frame.shape}"
+            physical_feedback = None
+            if _ARCHITECTURE.value == "proxy" and _robot_is_stuck():
+              physical_feedback = (
+                  "PHYSICAL FEEDBACK: The robot is currently STUCK and not moving "
+                  "forward despite your commands. You must YAW (turn) or move "
+                  "LATERALLY to clear the obstruction."
+              )
+
+            result = vlm.get_action(vlm_frame, physical_feedback=physical_feedback)
+
+            if physical_feedback is not None:
+              stuck_step_count[0] = 0
+
+            del vlm_frame
+            gc.collect()
+
+            if _ARCHITECTURE.value == "hybrid":
+              current_strategic_instruction[0] = result.get(
+                  "strategic_instruction", ""
+              ) or "Proceed forward carefully"
+              if vlm_log_file is not None:
+                log_entry = {
+                    "step": step_idx,
+                    "strategic_instruction": result.get("strategic_instruction", ""),
+                    "target_lane": result.get("target_lane", "center"),
+                    "explanation": result.get("explanation", ""),
+                }
+                vlm_log_file.write(json.dumps(log_entry) + "\n")
+                vlm_log_file.flush()
+              print(
+                  f"Step {step_idx}: VLM (Strategist) → {current_strategic_instruction[0][:60]}..."
+              )
+              if result.get("explanation"):
+                print(f"  Explanation: {result['explanation']}")
+            else:
+              if _VLM_SWAP_AXES.value:
+                raw_vlm_world = np.array(
+                    [result["vel_y"], -result["vel_x"], result["yaw_rate"]]
+                )
+              else:
+                raw_vlm_world = np.array(
+                    [result["vel_x"], -result["vel_y"], result["yaw_rate"]]
+                )
+              if vlm_log_file is not None:
+                log_entry = {
+                    "step": step_idx,
+                    "vel_x": result["vel_x"],
+                    "vel_y": result["vel_y"],
+                    "yaw_rate": result["yaw_rate"],
+                    "explanation": result.get("explanation", ""),
+                }
+                vlm_log_file.write(json.dumps(log_entry) + "\n")
+                vlm_log_file.flush()
+              print(
+                  f"Step {step_idx}: VLM → fwd={result['vel_x']:+.3f}  "
+                  f"lat={result['vel_y']:+.3f}  yaw={result['yaw_rate']:+.3f}"
+              )
+              if result.get("explanation"):
+                print(f"  Explanation: {result['explanation']}")
+
+        # Command derivation: proxy uses guardrails+rotation; hybrid/skip_vlm use VLA (no rotation)
+        if _ARCHITECTURE.value == "hybrid" or _SKIP_VLM.value:
+          fpv_frame = eval_env.render(
+              state, camera="front_vlm", height=render_h, width=render_w
           )
-
-          physical_feedback = None
-          if _robot_is_stuck():
-            physical_feedback = (
-                "PHYSICAL FEEDBACK: The robot is currently STUCK and not moving "
-                "forward despite your commands. You must YAW (turn) or move "
-                "LATERALLY to clear the obstruction."
-            )
-
-          cv2.imwrite(
-              "vlm_debug_input.jpg",
-              cv2.cvtColor(vlm_frame, cv2.COLOR_RGB2BGR),
-          )
-          print(
-              f"DEBUG: vlm_frame pixel range: {vlm_frame.min()} to {vlm_frame.max()}"
-          )
-
-          result = vlm.get_action(
-              vlm_frame,
-              physical_feedback=physical_feedback,
-              vision_mode=_VISION_MODE.value,
-          )
-
-          if physical_feedback is not None:
-            stuck_step_count[0] = 0  # Reset immediately after query sent
-
-          del vlm_frame
-          gc.collect()
-
-          if _VLM_SWAP_AXES.value:
-            raw_vlm_world = np.array(
-                [result["vel_y"], -result["vel_x"], result["yaw_rate"]]
-            )
-          else:
-            # Negate vel_y: VLM uses -Y=Left/+Y=Right → MuJoCo +Y=Left/-Y=Right
-            raw_vlm_world = np.array(
-                [result["vel_x"], -result["vel_y"], result["yaw_rate"]]
-            )
-
-          # Stream VLM response to disk (no RAM accumulation)
-          if vlm_log_file is not None:
-            log_entry = {
-                "step": step_idx,
-                "vel_x": result["vel_x"],
-                "vel_y": result["vel_y"],
-                "yaw_rate": result["yaw_rate"],
-                "explanation": result.get("explanation", ""),
-            }
-            vlm_log_file.write(json.dumps(log_entry) + "\n")
-            vlm_log_file.flush()
-
-          print(
-              f"Step {step_idx}: VLM → fwd={result['vel_x']:+.3f}  "
-              f"lat={result['vel_y']:+.3f}  yaw={result['yaw_rate']:+.3f}"
-          )
-          if result.get("explanation"):
-            print(f"  Explanation: {result['explanation']}")
-
-        current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
+          fpv_frame = np.array(jax.device_get(fpv_frame))
+          vla_cmd = vla.get_vla_action(fpv_frame, current_strategic_instruction[0])
+          vla_cmd_np = np.array(jax.device_get(vla_cmd))
+          current_vlm_command = np.clip(vla_cmd_np, -1.0, 1.0)
+        else:
+          current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
         vlm_commands_per_step.append(np.array(jax.device_get(current_vlm_command)))
 
         # Single jit call: obs update + policy + env.step (avoids recompile)
@@ -455,9 +465,14 @@ def main(argv):
           del img
           gc.collect()
 
+      except KeyboardInterrupt:
+        print("KeyboardInterrupt: cleaning up (env, video writer)...")
+
   finally:
     if vlm_log_file is not None:
       vlm_log_file.close()
+    if hasattr(eval_env, "close"):
+      eval_env.close()
     if _OUTPUT_VIDEO.value:
       print(f"Video saved: {Path(_OUTPUT_VIDEO.value)}")
 
