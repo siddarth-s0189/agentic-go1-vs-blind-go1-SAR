@@ -187,14 +187,29 @@ def main(argv):
       network_factory=network_factory,
       deterministic=True,
   )
-  jit_inference_fn = jax.jit(inference_fn)
-
-  # VLM (used for inference when vision_mode != none; always for video HUD)
-  vlm = vlm_bridge.GPT4pVLM()
-
   # Rollout loop (Python for-loop: VLM is blocking)
   rng = jax.random.PRNGKey(_SEED.value)
   state = eval_env.reset(rng)
+
+  # Jit-ed step: obs update + policy + env.step in one opaque call (avoids recompile)
+  is_dict_obs = isinstance(state.obs, dict)
+
+  def _step_with_command(state, vlm_cmd: jax.Array, rng):
+    """Update obs with command, run policy, step env. All in one jit."""
+    if is_dict_obs:
+      new_obs_val = state.obs["state"].at[45:48].set(vlm_cmd)
+      obs = {**state.obs, "state": new_obs_val}
+    else:
+      obs = state.obs.at[45:48].set(vlm_cmd)
+    state = state.replace(info={**state.info, "command": vlm_cmd}, obs=obs)
+    rng, act_key = jax.random.split(rng)
+    action = inference_fn(state.obs, act_key)[0]
+    return eval_env.step(state, action), rng
+
+  jit_step_with_command = jax.jit(_step_with_command)
+
+  # VLM (used for inference when vision_mode != none; always for video HUD)
+  vlm = vlm_bridge.GPT4pVLM()
   # Raw VLM output in world frame (forward=+X, lateral=+Y); updated every VLM query
   raw_vlm_world = np.array([0.0, 0.0, 0.0])
 
@@ -252,9 +267,9 @@ def main(argv):
     print("Vision mode: none (Blind) — VLM calls skipped, using zero command + guardrails.")
 
   # Streaming video: 640x480 per camera, write to disk during rollout (no RAM buildup)
-  render_every = 2
+  # Frames only at VLM steps (avoids wasting time on unused frames)
   render_h, render_w = 480, 640  # Fixed lower resolution for memory-constrained hardware
-  fps = 1.0 / eval_env.dt / render_every
+  fps = 1.0 / eval_env.dt / _VLM_INTERVAL.value
   scene_option = mujoco.MjvOption()
   scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True
   scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
@@ -369,26 +384,12 @@ def main(argv):
         current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
         vlm_commands_per_step.append(np.array(jax.device_get(current_vlm_command)))
 
-        # Immutable state update (JAX)
-        state = state.replace(
-            info={**state.info, "command": current_vlm_command}
-        )
+        # Single jit call: obs update + policy + env.step (avoids recompile)
+        vlm_cmd_jax = jp.array(jax.device_get(current_vlm_command))
+        state, rng = jit_step_with_command(state, vlm_cmd_jax, rng)
 
-        # Safely update the observation whether it's a Dict or a flat Array
-        if isinstance(state.obs, dict):
-          new_val = state.obs["state"].at[45:48].set(current_vlm_command)
-          state = state.replace(obs={**state.obs, "state": new_val})
-        else:
-          new_val = state.obs.at[45:48].set(current_vlm_command)
-          state = state.replace(obs=new_val)
-
-        # Policy action and step
-        rng, act_key = jax.random.split(rng)
-        action = jit_inference_fn(state.obs, act_key)[0]
-        state = eval_env.step(state, action)
-
-        # Stream frame to video (avoids RAM buildup)
-        if writer is not None and (step_idx + 1) % render_every == 0:
+        # Render for video only at VLM steps (avoids wasting time on unused frames)
+        if writer is not None and step_idx % _VLM_INTERVAL.value == 0:
           cmd_idx = _safe_cmd_idx(step_idx + 1)
           cmd = vlm_commands_per_step[cmd_idx]
           img = _render_frame(state, cmd)
