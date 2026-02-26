@@ -99,7 +99,8 @@ class OpenVLABridge:
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             load_in_4bit=True,
-            trust_remote_code=True
+            trust_remote_code=True,
+            attn_implementation="eager"
         )
         
         self.processor = AutoProcessor.from_pretrained(
