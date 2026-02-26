@@ -1,5 +1,7 @@
 #!/bin/bash
 # Master Production: VLA-Baseline vs Proxy vs Hybrid
+# Ensure OPENAI_API_KEY is available for proxy/hybrid (source .env if present)
+[ -f .env ] && set -a && source .env && set +a
 
 COMMON_ARGS="--env_name=Go1JoystickSARStage5 --episode_length=600 --n_rubble=60 --rubble_seed=42 --vlm_interval=60"
 

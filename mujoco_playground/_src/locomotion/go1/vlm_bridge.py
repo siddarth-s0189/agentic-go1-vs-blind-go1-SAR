@@ -362,7 +362,10 @@ class GPT4pVLM:
             "target_lane": lane,
             "explanation": str(parsed.get("explanation", "")),
         }
-    except Exception:
+    except Exception as e:
+      print(
+          f"⚠️ VLM API failed (returning safe stop). Check OPENAI_API_KEY and network: {e!r}"
+      )
       return safe_stop_proxy if self._architecture == "proxy" else safe_stop_hybrid
 
   def draw_hud(

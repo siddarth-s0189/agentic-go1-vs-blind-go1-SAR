@@ -409,8 +409,8 @@ def main(argv):
               print(
                   f"Step {step_idx}: VLM (Strategist) → {current_strategic_instruction[0][:60]}..."
               )
-              if result.get("explanation"):
-                print(f"  Explanation: {result['explanation']}")
+              expl = result.get("explanation", "") or "(none)"
+              print(f"  Explanation: {expl}")
             else:
               if _VLM_SWAP_AXES.value:
                 raw_vlm_world = np.array(
@@ -434,35 +434,35 @@ def main(argv):
                   f"Step {step_idx}: VLM → fwd={result['vel_x']:+.3f}  "
                   f"lat={result['vel_y']:+.3f}  yaw={result['yaw_rate']:+.3f}"
               )
-              if result.get("explanation"):
-                print(f"  Explanation: {result['explanation']}")
+              expl = result.get("explanation", "") or "(none)"
+              print(f"  Explanation: {expl}")
 
-        # Command derivation: proxy uses guardrails+rotation; hybrid/skip_vlm use VLA (no rotation)
-        if _ARCHITECTURE.value == "hybrid" or _SKIP_VLM.value:
-          fpv_frame = eval_env.render(
-              state, camera="front_vlm", height=render_h, width=render_w
-          )
-          fpv_frame = np.array(jax.device_get(fpv_frame))
-          vla_cmd = vla.get_vla_action(fpv_frame, current_strategic_instruction[0])
-          vla_cmd_np = np.array(jax.device_get(vla_cmd))
-          current_vlm_command = np.clip(vla_cmd_np, -1.0, 1.0)
-        else:
-          current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
-        vlm_commands_per_step.append(np.array(jax.device_get(current_vlm_command)))
+          # Command derivation: proxy uses guardrails+rotation; hybrid/skip_vlm use VLA (no rotation)
+          if _ARCHITECTURE.value == "hybrid" or _SKIP_VLM.value:
+            fpv_frame = eval_env.render(
+                state, camera="front_vlm", height=render_h, width=render_w
+            )
+            fpv_frame = np.array(jax.device_get(fpv_frame))
+            vla_cmd = vla.get_vla_action(fpv_frame, current_strategic_instruction[0])
+            vla_cmd_np = np.array(jax.device_get(vla_cmd))
+            current_vlm_command = np.clip(vla_cmd_np, -1.0, 1.0)
+          else:
+            current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
+          vlm_commands_per_step.append(np.array(jax.device_get(current_vlm_command)))
 
-        # Single jit call: obs update + policy + env.step (avoids recompile)
-        vlm_cmd_jax = jp.array(jax.device_get(current_vlm_command))
-        state, rng = jit_step_with_command(state, vlm_cmd_jax, rng)
+          # Single jit call: obs update + policy + env.step (avoids recompile)
+          vlm_cmd_jax = jp.array(jax.device_get(current_vlm_command))
+          state, rng = jit_step_with_command(state, vlm_cmd_jax, rng)
 
-        # Render for video every RENDER_EVERY steps (decoupled from VLM interval)
-        if writer is not None and step_idx % RENDER_EVERY == 0:
-          cmd_idx = _safe_cmd_idx(step_idx + 1)
-          cmd = vlm_commands_per_step[cmd_idx]
-          img = _render_frame(state, cmd)
-          img = np.array(jax.device_get(img)).astype(np.uint8)
-          writer.add_image(img)
-          del img
-          gc.collect()
+          # Render for video every RENDER_EVERY steps (decoupled from VLM interval)
+          if writer is not None and step_idx % RENDER_EVERY == 0:
+            cmd_idx = _safe_cmd_idx(step_idx + 1)
+            cmd = vlm_commands_per_step[cmd_idx]
+            img = _render_frame(state, cmd)
+            img = np.array(jax.device_get(img)).astype(np.uint8)
+            writer.add_image(img)
+            del img
+            gc.collect()
 
       except KeyboardInterrupt:
         print("KeyboardInterrupt: cleaning up (env, video writer)...")
