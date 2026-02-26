@@ -56,6 +56,7 @@ from brax.training.agents.ppo import networks as ppo_networks
 from etils import epath
 import math
 
+import cv2
 import jax
 import jax.numpy as jp
 import mediapy as media
@@ -296,13 +297,16 @@ def main(argv):
     return stuck_step_count[0] > 10
 
   # Initial command: proxy uses guardrails; hybrid/skip_vlm use VLA + action repeat
-  current_vla_action = None  # [vel_x, vel_y, yaw] numpy, updated every VLA_ACTION_REPEAT steps
+  current_vla_action = None  # scaled [vel_x, vel_y, yaw]
+  current_raw_action = None  # raw before scaling, for logging
   if _ARCHITECTURE.value == "hybrid" or _SKIP_VLM.value:
     frame0 = eval_env.render(state, camera="front_vlm", height=480, width=640)
     frame0 = np.array(jax.device_get(frame0))
-    init_cmd = vla.get_vla_action(frame0, current_strategic_instruction[0])
-    current_vla_action = np.array(jax.device_get(init_cmd))
-    vlm_commands_per_step = [np.clip(current_vla_action, -2.0, 2.0)]
+    cv2.imwrite("vla_debug_step_0.jpg", cv2.cvtColor(frame0, cv2.COLOR_RGB2BGR))
+    init_scaled, init_raw = vla.get_vla_action(frame0, current_strategic_instruction[0])
+    current_vla_action = np.array(jax.device_get(init_scaled))
+    current_raw_action = init_raw.copy()
+    vlm_commands_per_step = [current_vla_action.copy()]
   else:
     vlm_commands_per_step = [np.array(jax.device_get(_apply_guardrails_and_rotate(state, raw_vlm_world)))]
 
@@ -442,19 +446,30 @@ def main(argv):
 
           # Command derivation: proxy uses guardrails+rotation; hybrid/skip_vlm use VLA + action repeat
           if _ARCHITECTURE.value == "hybrid" or _SKIP_VLM.value:
-            # Action repeat: call VLA every VLA_ACTION_REPEAT steps (10 Hz); step 0 uses init
-            if step_idx > 0 and step_idx % VLA_ACTION_REPEAT == 0:
-              fpv_frame = eval_env.render(
-                  state, camera="front_vlm", height=render_h, width=render_w
+            # Action repeat: call VLA only when step_idx % 5 == 0; intermediate steps reuse
+            if step_idx % VLA_ACTION_REPEAT == 0:
+              if step_idx > 0:
+                fpv_frame = eval_env.render(
+                    state, camera="front_vlm", height=render_h, width=render_w
+                )
+                fpv_frame = np.array(jax.device_get(fpv_frame))
+                if step_idx in [0, 100]:
+                  cv2.imwrite(
+                      f"vla_debug_step_{step_idx}.jpg",
+                      cv2.cvtColor(fpv_frame, cv2.COLOR_RGB2BGR),
+                  )
+                scaled_cmd, raw_cmd = vla.get_vla_action(
+                    fpv_frame, current_strategic_instruction[0]
+                )
+                current_vla_action = np.array(jax.device_get(scaled_cmd))
+                current_raw_action = raw_cmd
+              current_vlm_command = current_vla_action.copy()
+              print(
+                  f"STEP {step_idx} | Raw: {current_raw_action[:3]} | Scaled: {current_vla_action[:3]}",
+                  flush=True,
               )
-              fpv_frame = np.array(jax.device_get(fpv_frame))
-              vla_cmd = vla.get_vla_action(fpv_frame, current_strategic_instruction[0])
-              current_vla_action = np.array(jax.device_get(vla_cmd))
-            current_vlm_command = np.clip(current_vla_action, -2.0, 2.0)
-            print(
-                f"STEP {step_idx} | VLA Command: {current_vla_action}",
-                flush=True,
-            )
+            else:
+              current_vlm_command = current_vla_action.copy()
           else:
             current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
           vlm_commands_per_step.append(np.array(jax.device_get(current_vlm_command)))

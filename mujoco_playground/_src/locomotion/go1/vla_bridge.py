@@ -170,15 +170,13 @@ class OpenVLABridge:
             action = self.model.predict_action(**inputs, unnorm_key="bridge_orig")
 
         # OpenVLA returns 7DoF [x, y, z, roll, pitch, yaw, gripper] -> map to [vel_x, vel_y, yaw]
-        # Values from unnorm_key='bridge_orig' are in real-world units; apply velocity gain
+        # BridgeV2 units are very small; scale by 250 to match Go1 velocity command range
         action = np.asarray(action, dtype=np.float32)
         n = len(action)
-        vla_v_x = float(action[0]) if n > 0 else 0.0
-        vla_v_y = float(action[1]) if n > 1 else 0.0
-        vla_yaw = float(action[5]) if n > 5 else 0.0
-        linear_gain, angular_gain = 5.0, 2.0
-        vla_v_x *= linear_gain
-        vla_v_y *= linear_gain
-        vla_yaw *= angular_gain
-
-        return jp.array([vla_v_x, vla_v_y, vla_yaw], dtype=jp.float32)
+        raw = np.array([
+            float(action[0]) if n > 0 else 0.0,
+            float(action[1]) if n > 1 else 0.0,
+            float(action[5]) if n > 5 else 0.0,
+        ], dtype=np.float32)
+        scaled = np.clip(raw * 250.0, -2.0, 2.0)
+        return jp.array(scaled, dtype=jp.float32), raw
