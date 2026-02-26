@@ -21,16 +21,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 os.environ.setdefault("MUJOCO_GL", "egl")
-_xla = os.environ.get("XLA_FLAGS", "") + " --xla_gpu_triton_gemm_any=True"
-os.environ["XLA_FLAGS"] = _xla
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-# Prevent JAX from pre-allocating 75-90% of VRAM
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-# Alternatively, use a safe cap (60% of total VRAM)
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.60'
-# Disable Triton GEMM to prevent some rare WSL2 memory leaks
-os.environ['XLA_FLAGS'] = '--xla_gpu_enable_triton_gemm=false'
+# JAX/GPU: prevent VRAM race with PyTorch (OpenVLA)
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.60")
+# Consolidated XLA flags (avoid duplicate/circular registration on Colab)
+_xla = os.environ.get("XLA_FLAGS", "")
+if "--xla_gpu_enable_triton_gemm=false" not in _xla:
+    _xla = (_xla + " --xla_gpu_enable_triton_gemm=false").strip()
+os.environ["XLA_FLAGS"] = _xla
 
 # Orbax 0.7+ compatibility: bridge legacy Brax (PyTreeCheckpointer) to 2026 API
 import orbax.checkpoint as ocp

@@ -80,56 +80,100 @@ VRAM note: Loading OpenVLA-7B on L4 (24GB) in 4-bit consumes ~5-7GB VRAM,
 leaving enough room for the MuJoCo simulation and JAX buffers.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
+
+import numpy as np
 import torch
 import jax.numpy as jp
+from PIL import Image
 from transformers import AutoModelForVision2Seq, AutoProcessor
 
+try:
+    from transformers import BitsAndBytesConfig
+except ImportError:
+    BitsAndBytesConfig = None
+
 if TYPE_CHECKING:
-    import numpy as np
+    pass
+
+
+def _frame_to_pil(frame: Union["np.ndarray", "Image.Image"]) -> "Image.Image":
+    """Convert numpy array or PIL Image to PIL Image for OpenVLA processor."""
+    if hasattr(frame, "convert"):
+        return frame.convert("RGB")
+    arr = np.asarray(frame)
+    if arr.ndim != 3 or arr.shape[-1] not in (3, 4):
+        raise ValueError(
+            f"Expected frame shape (H, W, 3) or (H, W, 4), got {getattr(arr, 'shape', 'unknown')}"
+        )
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    if arr.dtype != np.uint8:
+        if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0:
+            arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
+        else:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
+
 
 class OpenVLABridge:
     def __init__(self, device="cuda", dtype="bf16"):
         self.device = device
-        
+
+        # Use BitsAndBytesConfig when available (silences load_in_4bit deprecation)
+        load_kwargs = {
+            "torch_dtype": torch.bfloat16,
+            "low_cpu_mem_usage": True,
+            "trust_remote_code": True,
+            "attn_implementation": "eager",
+        }
+        if BitsAndBytesConfig is not None:
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+        else:
+            load_kwargs["load_in_4bit"] = True
+
         # We use AutoModelForVision2Seq because OpenVLA's custom configuration
         # is compatible with this AutoClass as long as trust_remote_code=True.
         self.model = AutoModelForVision2Seq.from_pretrained(
             "openvla/openvla-7b",
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            load_in_4bit=True,
-            trust_remote_code=True,
-            attn_implementation="eager"
+            **load_kwargs,
         )
-        
+
+        # Belt-and-suspenders: transformers 4.48+ may access _supports_sdpa
+        if not hasattr(self.model, "_supports_sdpa"):
+            self.model._supports_sdpa = False
+
         self.processor = AutoProcessor.from_pretrained(
-            "openvla/openvla-7b", 
-            trust_remote_code=True
+            "openvla/openvla-7b",
+            trust_remote_code=True,
         )
-        
-        # Warm up the model to ensure the first step isn't delayed by kernel loading
+
         print("🚀 OpenVLA-7B Pilot Initialized on L4 GPU.")
 
-    def get_vla_action(self, fpv_frame, strategic_instruction):
+    def get_vla_action(self, fpv_frame, strategic_instruction: str):
         """
         Takes the FPV image and the high-level VLM strategy to output low-level velocities.
+
+        Accepts fpv_frame as numpy array (H,W,3) or PIL Image; MuJoCo render returns numpy.
         """
-        # Format the prompt exactly as OpenVLA was trained
+        img = _frame_to_pil(fpv_frame)
         prompt = f"Inhabitants: What action should the robot take to {strategic_instruction}?"
-        
-        # Preprocess image and text
-        inputs = self.processor(prompt, fpv_frame, return_tensors="pt").to(self.device, torch.bfloat16)
-        
-        # Inference using the OpenVLA-specific action head
+        inputs = self.processor(prompt, img, return_tensors="pt").to(
+            self.device, torch.bfloat16
+        )
+
         with torch.no_grad():
             action = self.model.predict_action(**inputs, unnorm_key="bridge_orig")
-            
-        # OpenVLA returns a 7DoF action [x, y, z, roll, pitch, yaw, gripper]
-        # We map these to the Go1 [vel_x, vel_y, yaw_rate]
-        # We apply a slight scaling factor to ensure the robot doesn't lunge too fast
-        vla_v_x = action[0] 
-        vla_v_y = action[1]
-        vla_yaw = action[5]
+
+        # OpenVLA returns 7DoF [x, y, z, roll, pitch, yaw, gripper] -> map to [vel_x, vel_y, yaw]
+        action = np.asarray(action, dtype=np.float32)
+        n = len(action)
+        vla_v_x = float(action[0]) if n > 0 else 0.0
+        vla_v_y = float(action[1]) if n > 1 else 0.0
+        vla_yaw = float(action[5]) if n > 5 else 0.0
 
         return jp.array([vla_v_x, vla_v_y, vla_yaw], dtype=jp.float32)
