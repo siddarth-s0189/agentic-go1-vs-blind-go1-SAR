@@ -134,6 +134,7 @@ _ARCHITECTURE = flags.DEFINE_enum(
 
 
 RENDER_EVERY = 5  # Frames between video renders (decoupled from VLM interval)
+VLA_ACTION_REPEAT = 5  # 10 Hz: call VLA every 5 steps (ctrl_dt≈0.02s -> 10 Hz)
 
 
 def main(argv):
@@ -294,12 +295,14 @@ def main(argv):
   def _robot_is_stuck() -> bool:
     return stuck_step_count[0] > 10
 
-  # Initial command: proxy uses guardrails; hybrid/skip_vlm use VLA + clip (no rotation)
+  # Initial command: proxy uses guardrails; hybrid/skip_vlm use VLA + action repeat
+  current_vla_action = None  # [vel_x, vel_y, yaw] numpy, updated every VLA_ACTION_REPEAT steps
   if _ARCHITECTURE.value == "hybrid" or _SKIP_VLM.value:
     frame0 = eval_env.render(state, camera="front_vlm", height=480, width=640)
     frame0 = np.array(jax.device_get(frame0))
     init_cmd = vla.get_vla_action(frame0, current_strategic_instruction[0])
-    vlm_commands_per_step = [np.clip(np.array(jax.device_get(init_cmd)), -1.0, 1.0)]
+    current_vla_action = np.array(jax.device_get(init_cmd))
+    vlm_commands_per_step = [np.clip(current_vla_action, -2.0, 2.0)]
   else:
     vlm_commands_per_step = [np.array(jax.device_get(_apply_guardrails_and_rotate(state, raw_vlm_world)))]
 
@@ -437,15 +440,21 @@ def main(argv):
               expl = result.get("explanation", "") or "(none)"
               print(f"  Explanation: {expl}")
 
-          # Command derivation: proxy uses guardrails+rotation; hybrid/skip_vlm use VLA (no rotation)
+          # Command derivation: proxy uses guardrails+rotation; hybrid/skip_vlm use VLA + action repeat
           if _ARCHITECTURE.value == "hybrid" or _SKIP_VLM.value:
-            fpv_frame = eval_env.render(
-                state, camera="front_vlm", height=render_h, width=render_w
+            # Action repeat: call VLA every VLA_ACTION_REPEAT steps (10 Hz); step 0 uses init
+            if step_idx > 0 and step_idx % VLA_ACTION_REPEAT == 0:
+              fpv_frame = eval_env.render(
+                  state, camera="front_vlm", height=render_h, width=render_w
+              )
+              fpv_frame = np.array(jax.device_get(fpv_frame))
+              vla_cmd = vla.get_vla_action(fpv_frame, current_strategic_instruction[0])
+              current_vla_action = np.array(jax.device_get(vla_cmd))
+            current_vlm_command = np.clip(current_vla_action, -2.0, 2.0)
+            print(
+                f"STEP {step_idx} | VLA Command: {current_vla_action}",
+                flush=True,
             )
-            fpv_frame = np.array(jax.device_get(fpv_frame))
-            vla_cmd = vla.get_vla_action(fpv_frame, current_strategic_instruction[0])
-            vla_cmd_np = np.array(jax.device_get(vla_cmd))
-            current_vlm_command = np.clip(vla_cmd_np, -1.0, 1.0)
           else:
             current_vlm_command = _apply_guardrails_and_rotate(state, raw_vlm_world)
           vlm_commands_per_step.append(np.array(jax.device_get(current_vlm_command)))
