@@ -12,22 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""VLM bridge for Go1 SAR navigation using GPT-4o vision."""
+"""VLM bridge for Go1 SAR navigation using Gemini via Vertex AI.
 
-import base64
+Uses gemini-robotics-er-1.5-preview for the Strategist.
+Shared Vertex config with vertex_vla_bridge via vertex_config.py.
+"""
+
 import json
-import os
 import pathlib
+import time
 from typing import Dict
 
 import cv2
 import numpy as np
-from openai import OpenAI
 
+from mujoco_playground._src.locomotion.go1 import vertex_config
 
 # ---------------------------------------------------------------------------
-# Procedural environment generator
+# Procedural environment generator (unchanged from legacy)
 # ---------------------------------------------------------------------------
+
 
 def generate_stage5_xml(seed: int = 42, n_rubble: int = 120) -> str:
   """Generate and write Stage 5 XML with a realistic debris field.
@@ -171,36 +175,7 @@ def generate_stage5_xml(seed: int = 42, n_rubble: int = 120) -> str:
   return str(xml_path)
 
 
-# Soloist (proxy) and Strategist (hybrid) system prompts.
-SOLOIST_SYSTEM_PROMPT = """You are an expert navigator for a Go1 quadruped. You are receiving a Birds-Eye View (BEV). Use this as your GLOBAL MAP to identify the clearest path to the goal (Red Dot) across the whole field.
-
-### SPATIAL ORIENTATION
-- The robot is currently facing the RIGHT side of the frame.
-- TOP of the image = Robot's LEFT (NEGATIVE vel_y).
-- BOTTOM of the image = Robot's RIGHT (POSITIVE vel_y).
-- RIGHT of the image = Robot's FORWARD (POSITIVE vel_x).
-
-### NAVIGATION CONSTRAINTS
-- The navigable corridor is Y = -1.5 to 1.5. Stay centered.
-- Walk over small debris, but navigate around blocks taller than your knees.
-
-### TEMPORAL AWARENESS
-- IMPORTANT: You operate in a high-latency loop. Every command is executed for 1.2 seconds (60 physics steps).
-- At vel_x = 0.8, you travel 1 meter before the next frame. 
-- Imagine your position 1.2s in the future and ensure your chosen speed won't carry you into an obstacle.
-
-### GOAL
-- Reach the red marker at the far end of the field (World +X).
-
-### OUTPUT FORMAT
-Respond ONLY with a JSON object:
-{
-  "vel_x": float,
-  "vel_y": float,
-  "yaw_rate": float,
-  "explanation": "string"
-}"""
-
+# Strategist system prompt: VLM sees BEV, provides instruction for VLA (FPV).
 STRATEGIST_SYSTEM_PROMPT = """You are the High-Level Strategist for a Go1 quadruped. You receive a Birds-Eye View (BEV) map. Your role is to provide a Strategic Instruction to a low-level VLA pilot that sees the First-Person View (FPV) and handles reactive dodging.
 
 ### SPATIAL ORIENTATION
@@ -221,168 +196,117 @@ STRATEGIST_SYSTEM_PROMPT = """You are the High-Level Strategist for a Go1 quadru
 Respond ONLY with a JSON object:
 {
   "strategic_instruction": "string",
-  "target_lane": "left/center/right",
   "explanation": "string"
 }"""
 
 
-class GPT4pVLM:
-  """Vision Language Model bridge for quadruped SAR navigation."""
+# Strategist model ID per user spec
+STRATEGIST_MODEL = "gemini-robotics-er-1.5-preview"
 
-  DEFAULT_MODEL = "gpt-4o"
 
-  def __init__(self, architecture: str = "proxy") -> None:
-    if architecture not in ("proxy", "hybrid"):
+class VertexVLM:
+  """Strategist VLM: BEV → strategic instruction for VLA (FPV) pilot."""
+
+  def __init__(self) -> None:
+    self._client = vertex_config.get_vertex_client()
+    if not self._client:
       raise ValueError(
-          f"architecture must be 'proxy' or 'hybrid', got {architecture!r}"
+          "Vertex AI client not available. Set GOOGLE_CLOUD_PROJECT (and "
+          "GOOGLE_CLOUD_LOCATION if needed). pip install google-genai"
       )
-    self._architecture = architecture
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-      raise ValueError("OPENAI_API_KEY environment variable is required")
-    self._client = OpenAI(api_key=api_key)
-    self._model = self.DEFAULT_MODEL
+    self._model = STRATEGIST_MODEL
+    print(f"Vertex VLM (Strategist) initialized: {self._model}")
 
-  def encode_image(self, image_array: np.ndarray) -> str:
-    """Convert RGB numpy array to base64 JPEG string.
+  def encode_image(self, image_array: np.ndarray) -> bytes:
+    """Convert RGB numpy array to JPEG bytes for Vertex AI.
 
     Args:
       image_array: Numpy array of shape (H, W, 3), dtype uint8, RGB format.
-        MuJoCo renderer returns RGB.
 
     Returns:
-      Base64-encoded JPEG string.
+      JPEG bytes (not base64).
     """
-    # MuJoCo render() returns RGB; cv2.imencode expects BGR
     if len(image_array.shape) != 3 or image_array.shape[-1] != 3:
       raise ValueError(
           f"Expected RGB image (H, W, 3), got shape {image_array.shape}"
       )
     bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
     _, jpeg_bytes = cv2.imencode(".jpg", bgr)
-    return base64.b64encode(jpeg_bytes.tobytes()).decode("utf-8")
+    return jpeg_bytes.tobytes()
 
   def get_action(
       self,
       image: np.ndarray,
-      physical_feedback: str | None = None,
   ) -> Dict:
-    """Get navigation command from GPT-4o vision based on the frame(s).
+    """Get navigation command from Gemini vision based on the frame.
 
     Args:
-      image: RGB birds-eye view image array (H, W, 3). Architecture handles
-        routing: caller passes birds_eye for both proxy and hybrid.
-      physical_feedback: Optional proprioceptive feedback to append to the
-        prompt (e.g. "Robot is stuck").
-
+      image: RGB birds-eye view image array (H, W, 3).
     Returns:
-      Dict with vel_x, vel_y, yaw_rate, explanation (proxy) or
-      strategic_instruction, target_lane, explanation (hybrid). On API failure,
-      returns safe stop.
+      Dict with exactly strategic_instruction and explanation.
     """
-    safe_stop_proxy = {"vel_x": 0.0, "vel_y": 0.0, "yaw_rate": 0.0, "explanation": ""}
-    safe_stop_hybrid = {"strategic_instruction": "", "target_lane": "center", "explanation": ""}
+    safe_stop = {"strategic_instruction": "", "explanation": ""}
 
     try:
-      base64_str = self.encode_image(image)
-      user_text = "Analyze this Birds-Eye View and provide navigation."
-      if physical_feedback:
-        user_text += f" {physical_feedback}"
+      image_bytes = self.encode_image(image)
+      user_text = "Analyze this Birds-Eye View and provide a strategic instruction."
 
-      if self._architecture == "proxy":
-        system_prompt = SOLOIST_SYSTEM_PROMPT
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "navigation_response",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "vel_x": {"type": "number", "description": "Forward velocity -1.0 to 1.0"},
-                        "vel_y": {"type": "number", "description": "Lateral velocity -1.0 to 1.0"},
-                        "yaw_rate": {"type": "number", "description": "Yaw rate -1.0 to 1.0"},
-                        "explanation": {"type": "string", "description": "Brief reasoning"},
-                    },
-                    "required": ["vel_x", "vel_y", "yaw_rate", "explanation"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-      else:
-        system_prompt = STRATEGIST_SYSTEM_PROMPT
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "strategist_response",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "strategic_instruction": {"type": "string", "description": "Instruction for low-level pilot"},
-                        "target_lane": {"type": "string", "description": "left, center, or right"},
-                        "explanation": {"type": "string", "description": "Brief reasoning"},
-                    },
-                    "required": ["strategic_instruction", "target_lane", "explanation"],
-                    "additionalProperties": False,
-                },
-            },
-        }
+      from google.genai import types
 
-      response = self._client.chat.completions.create(
+      parts = [
+          types.Part.from_text(text=user_text),
+          types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+      ]
+      response_schema = {
+          "type": "object",
+          "properties": {
+              "strategic_instruction": {"type": "string", "description": "Instruction for low-level pilot"},
+              "explanation": {"type": "string", "description": "Brief reasoning"},
+          },
+          "required": ["strategic_instruction", "explanation"],
+      }
+
+      t0 = time.perf_counter()
+      response = self._client.models.generate_content(
           model=self._model,
-          messages=[
-              {"role": "system", "content": system_prompt},
-              {
-                  "role": "user",
-                  "content": [
-                      {"type": "text", "text": user_text},
-                      {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_str}"}},
-                  ],
-              },
-          ],
-          response_format=response_format,
+          contents=types.UserContent(parts=parts),
+          config=types.GenerateContentConfig(
+              system_instruction=STRATEGIST_SYSTEM_PROMPT,
+              response_mime_type="application/json",
+              response_schema=response_schema,
+              temperature=0.2,
+          ),
       )
-      content = response.choices[0].message.content
+      elapsed = time.perf_counter() - t0
+      content = response.text
+      if elapsed > 2.0:
+        print(f"  VLM latency: {elapsed:.2f}s")
+      if not content:
+        raise ValueError("Empty model response")
       parsed = json.loads(content)
 
-      if self._architecture == "proxy":
-        return {
-            "vel_x": float(np.clip(parsed["vel_x"], -1.0, 1.0)),
-            "vel_y": float(np.clip(parsed["vel_y"], -1.0, 1.0)),
-            "yaw_rate": float(np.clip(parsed["yaw_rate"], -1.0, 1.0)),
-            "explanation": str(parsed.get("explanation", "")),
-        }
-      else:
-        lane = str(parsed.get("target_lane", "center")).lower()
-        if lane not in ("left", "center", "right"):
-          lane = "center"
-        return {
-            "strategic_instruction": str(parsed.get("strategic_instruction", "")),
-            "target_lane": lane,
-            "explanation": str(parsed.get("explanation", "")),
-        }
+      return {
+          "strategic_instruction": str(parsed.get("strategic_instruction", "")),
+          "explanation": str(parsed.get("explanation", "")),
+      }
+
     except Exception as e:
       print(
-          f"⚠️ VLM API failed (returning safe stop). Check OPENAI_API_KEY and network: {e!r}"
+          f"⚠️ VLM API failed (returning safe stop). Check Vertex config: {e!r}"
       )
-      return safe_stop_proxy if self._architecture == "proxy" else safe_stop_hybrid
+      return safe_stop
 
   def draw_hud(
       self,
       image: np.ndarray,
-      current_vlm_command: np.ndarray,
+      strategic_instruction: str,
       camera: str = "birds_eye",
   ) -> np.ndarray:
     """Draw minimal HUD overlay: title bar only.
 
-    Red boundary lines and velocity arrow have been removed. The glass-box
-    walls in the MuJoCo scene replace the 2-D corridor overlay, and VLM
-    commands are printed to stdout rather than overlaid on the frame.
-
     Args:
       image: RGB image array (H, W, 3).
-      current_vlm_command: Array [vel_x, vel_y, yaw_rate] (kept for API compat).
+      strategic_instruction: Current strategist message for display compatibility.
       camera: Camera name (kept for API compat).
 
     Returns:
@@ -393,7 +317,7 @@ class GPT4pVLM:
 
     cv2.putText(
         img,
-        "GPT-4o AUTONOMOUS NAV",
+        "Gemini AUTONOMOUS NAV",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -401,5 +325,6 @@ class GPT4pVLM:
         2,
         cv2.LINE_AA,
     )
+    _ = (strategic_instruction, camera)
 
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
